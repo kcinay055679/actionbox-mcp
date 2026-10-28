@@ -6,10 +6,12 @@
 - **Origin:**
   - Requirements session (grill-me method, Q1–Q21)
   - Refinement session (grill-with-docs, R1–R24)
+  - Prior-art review (R25–R29)
 - **Related:**
   - [README.md](README.md): user-facing contract
   - [GLOSSARY.md](GLOSSARY.md): terms
   - [docs/adr/](docs/adr/): ADR 0001 (single engine), ADR 0002 (trust check)
+  - [docs/research/prior-art.md](docs/research/prior-art.md): existing tools
 
 Terms (owner, project, action, job, engine, broker, shim, fetch request, fetch, trusted commit, writes dir, protected path, project cache) are used as defined in GLOSSARY.md.
 
@@ -66,7 +68,10 @@ The goal is a **fixed, per-project set of actions** that the agent can invoke an
 | OS | Pop!_OS (Ubuntu 22.04 base), Sway/Regolith | [obs-H] |
 | cgroups | v2; user manager delegates `cpuset cpu io memory pids` | [obs-H] |
 | Podman | 3.4.4, runtime crun 0.17; Docker-compat API reports 1.40 | [obs-H], [src] podman v3.4.4 `version/version.go` |
-| bubblewrap | 0.6.1 (no overlay support; that needs ≥ 0.11) | [obs-H], [doc] bwrap NEWS |
+| bubblewrap (host package) | 0.6.1: lacks the symlink-escape fix (GHSA-pxhw-h44j-8pfx, fixed in 0.12.0) and `--bind-fd` (0.10.0) | [obs-H], [doc] bwrap NEWS |
+| bubblewrap (required, R25) | ≥ 0.13.1, path set in `config.toml` (`bwrap_path`); host package stays untouched | [doc] bwrap NEWS |
+| Maven (required, R28) | ≥ 3.9.0 for `maven.repo.local.tail` | [src] maven `DefaultRepositorySystemSessionFactory` |
+| npm (fetch guards, R29) | 12.x for `min-release-age`; `allow-git` / `allow-remote` default `none` | [src] npm/cli `definitions.js` |
 | util-linux | 2.37.2 (no `unshare --map-auto`) | [obs-H] |
 | `/dev/net/tun` | `crw-rw-rw-` | [obs-H] |
 | subuid | `100000:65536` (inferred from the observed uid_map) | [obs-H] |
@@ -111,10 +116,10 @@ The goal is a **fixed, per-project set of actions** that the agent can invoke an
 | R4 | Project registration (was DECIDE-1) | Broker serves only projects registered in `config.toml`; any agent may call any registered project | Shim's `repo` is agent-controlled; all registered projects are owner-signed | Socket per project |
 | R5 | Trust check (was DECIDE-3) | Raw objects, re-hash, `gpgv`, byte compare; no git porcelain (ADR 0002) | Git doesn't re-hash on read; repo config and `.gitattributes` can run commands | `git log %G?` + `git diff` with `-c` overrides |
 | R6 | Rollback (was DECIDE-4) | Candidate commit must descend from the trusted commit; override with `verify --accept` | Simple, fails closed | Revocation list of retired blobs |
-| R7 | Symlinks (was DECIDE-2) | `lstat` check before start **plus** a dev/inode check inside the sandbox after mounting | Agent can swap a dir for a symlink between check and mount | `lstat` only |
+| R7 | Symlinks (was DECIDE-2) | `lstat` check before start **plus** a dev/inode check inside the sandbox after mounting. Primary mechanism replaced by **R26**; inode check stays as backstop | Agent can swap a dir for a symlink between check and mount | `lstat` only |
 | R8 | Shim registration (was DECIDE-5) | User scope (`claude mcp add --scope user`); the shim holds no trust | Agent can reach `broker.sock` directly anyway | Treating `.mcp.json` as a control |
 | R9 | Vocabulary | GLOSSARY.md; "allowlist" and "sandbox profile" avoided | Overloaded terms | — |
-| R10 | Docker API version | Container jobs pin docker-java `api.version=1.40` | Testcontainers ≥ 2.0.2 sends 1.44; Podman 3.4 implements 1.40 but doesn't enforce the version [src] | Unpinned |
+| R10 | Docker API version | ~~Container jobs pin docker-java `api.version=1.40`~~ superseded by **R27** | Testcontainers ≥ 2.0.2 sends 1.44; Podman 3.4 implements 1.40 but doesn't enforce the version [src] | Unpinned |
 | R11 | Fetch plugin (was O7) | `maven-dependency-plugin:3.11.0`; owner's `settings.xml` mirrors/credentials apply | Latest release (2026-05-24) [src] | — |
 | R12 | Protected paths (was O1) | Add Fence's built-in list, `.gitattributes`, all of `.git`; existing protected-name files at depth ≤ 3 inside writes dirs are re-bound read-only | Mirror Fence's mandatory protection [src] | Root-level only |
 | R13 | Engine root filesystem | `--ro-bind / /` + explicit tmpfs and dev/proc mounts instead of `--dev-bind / /` | `--dev-bind / /` left `/var/tmp`, `/dev/shm`, `/media`, `/mnt` writable/readable | `--dev-bind / /` |
@@ -129,6 +134,16 @@ The goal is a **fixed, per-project set of actions** that the agent can invoke an
 | R22 | npm install scripts | No `--ignore-scripts` in examples; per-action choice | Scripts run inside the job sandbox, which is the threat-C containment | Always `--ignore-scripts` |
 | R23 | Flag injection | Param values starting with `-` rejected unless `allow_leading_dash = true` | A whole-element placeholder could inject flags | Owner patterns only |
 | R24 | MCP library | `github.com/modelcontextprotocol/go-sdk`, stdio | Official SDK | — |
+
+### 5.3 Prior-art review (R25–R29)
+
+| # | Question | Decision | Why | Rejected |
+|---|---|---|---|---|
+| R25 | bwrap version | Require bwrap ≥ 0.13.1 (Nix or local build), configured via `bwrap_path` | 0.6.1 lacks the 0.12.0 symlink-escape fix in the core of the engine | Host package 0.6.1 |
+| R26 | Mount race (R7) | Broker opens each bound project path `O_PATH\|O_NOFOLLOW` (via `openat2` `RESOLVE_NO_SYMLINKS` from the repo dirfd), checks the fd, passes it with `--bind-fd` / `--ro-bind-fd`; post-mount inode check stays as backstop | Removes the check/mount race at the source; same pattern Flatpak adopted for CVE-2024-42472 | Inode check only |
+| R27 | Docker API pin | No pin by default; Testcontainers ≥ 2.0.3 falls back to 1.32 itself. Add `api.version=1.40` only if A2 fails | Avoid config that may be unnecessary | Pin 1.40 (R10) |
+| R28 | Project cache in jobs | Maven: project cache mounted **read-only** as `maven.repo.local.tail`, writable per-job head in the job dir. npm: cache stays writable, behavior observed (O11) | Jobs can't poison the Maven cache; npm cache gives "no guarantee" of keeping entries [doc] | Writable Maven cache; verdaccio now |
+| R29 | Fetch guards | Each fetch records the sha256 of every fetched file next to its coordinate in a per-project fetch ledger; npm fetches set `min-release-age` and keep `allow-git` / `allow-remote` at `none` | Ledger makes the cache auditable (Nix fixed-output idea); cheap npm supply-chain guards | No record |
 
 ## 6. What we tried
 
@@ -205,7 +220,8 @@ The agent's Fence must **not** have write access to any of these.
 |---|---|
 | `~/.config/actionbox/config.toml` | Pinned fingerprint, projects, toolchain paths and env, limit caps and defaults, retention |
 | `~/.local/share/actionbox/keyring.gpg` | Verifier keyring for `gpgv`: the owner's **public** key only |
-| `~/.local/share/actionbox/projects/<name>/m2/` | Maven project cache |
+| `~/.local/share/actionbox/projects/<name>/m2/` | Maven project cache (read-only in jobs, written by fetches only) |
+| `~/.local/share/actionbox/projects/<name>/ledger.jsonl` | Fetch ledger: one line per fetched file, `{request_id, ecosystem, coordinate, path, sha256, fetched_at}` |
 | `~/.local/share/actionbox/projects/<name>/npm/` | npm project cache |
 | `~/.local/share/actionbox/projects/<name>/containers/{store,run}/` | Podman graphroot + runroot (always used as a pair) |
 | `~/.local/share/actionbox/projects/<name>/lock` | `flock` target: one job or fetch at a time per project |
@@ -218,6 +234,8 @@ The agent's Fence must **not** have write access to any of these.
 
 ```toml
 pinned_fingerprint = "<40 hex, primary key>"
+bwrap_path = "/home/yminder/.nix-profile/bin/bwrap"   # ≥ 0.13.1 (R25)
+npm_min_release_age = 7                               # days, fetch only (R29) ⚠ unit
 
 [projects.pcts]
 path = "/home/yminder/projects/pcts"
@@ -300,10 +318,11 @@ kind        = "coordinate-fetch"
 - Project-relative **directories**.
 - Not allowed: absolute paths, `..`, globs, a protected path, or an ancestor or descendant of a protected path.
 
-**Symlinks (R7)**
-- Before start, the broker `lstat`s every component of the project root, of each writes dir and of each protected path. It refuses if any component is a symlink.
-- It creates missing writes dirs, then records each bound path's `(dev, inode)` in the job's `meta.json`.
-- After mounting, `job-init` re-stats each mount point inside the sandbox. It aborts the job if any `(dev, inode)` differs.
+**Symlinks (R7, R26)**
+- The broker opens the project root, then each writes dir and each existing protected path relative to it, with `openat2(…, O_PATH|O_NOFOLLOW, RESOLVE_NO_SYMLINKS)`. Any symlink component fails the job before start.
+- It creates missing writes dirs the same way (`mkdirat` on the parent fd).
+- bwrap binds **from those fds** (`--bind-fd`, `--ro-bind-fd`), so a path swapped after the check is never mounted.
+- Backstop: each fd's `(dev, inode)` is recorded in `meta.json`. After mounting, `job-init` re-stats each mount point and aborts on a mismatch.
 
 **Limits**
 - Optional per action, clamped to the caps in `config.toml`.
@@ -412,17 +431,17 @@ Notes:
    | `LANG` | `C.UTF-8` |
    | `TERM` | `dumb` |
    | `TMPDIR` | `/tmp` |
-   | `MAVEN_OPTS` | `-Dmaven.repo.local=<cache>/m2` |
+   | `MAVEN_OPTS` | `-Dmaven.repo.local=$JOB/m2 -Dmaven.repo.local.tail=<cache>/m2` (R28) |
    | `npm_config_cache` | `<cache>/npm` [doc] npm config |
    | `[toolchain].env` | e.g. `JAVA_HOME` |
    | Container jobs only | `XDG_RUNTIME_DIR`, `CONTAINERS_CONF`, `CONTAINERS_STORAGE_CONF`, `DOCKER_HOST`, `TESTCONTAINERS_RYUK_DISABLED=true` |
 
 6. **Retention (R20).** After each job, and at `serve` startup, prune `jobs/<name>/`. Keep the newest `jobs_per_project` and drop anything older than `max_age`.
 
-### 8.8 Engine (R3, R13, R14, ADR 0001)
+### 8.8 Engine (R3, R13, R14, R25, R26, ADR 0001)
 
 ```bash
-podman unshare -- bwrap \
+podman unshare -- "$BWRAP_PATH" \
   --ro-bind / / \
   --dev /dev --dev-bind /dev/net/tun /dev/net/tun --proc /proc \
   --tmpfs /run --tmpfs /tmp --tmpfs /var/tmp --tmpfs /dev/shm \
@@ -431,10 +450,13 @@ podman unshare -- bwrap \
   --unshare-net --unshare-pid --unshare-ipc --new-session --die-with-parent \
   --clearenv <--setenv for each §8.7 variable> \
   <for each toolchain ro_path T: --ro-bind T T> \
-  --ro-bind "$REPO" "$REPO" \
-  <for each writes dir D: --bind "$REPO/D" "$REPO/D"> \
-  <for each protected path P (root + depth ≤ 3 in writes): --ro-bind-try "$REPO/P" "$REPO/P"> \
-  --bind "$CACHE" "$CACHE" --bind "$JOB" "$JOB" \
+  --ro-bind-fd $FD_REPO "$REPO" \
+  <for each writes dir D: --bind-fd $FD_D "$REPO/D"> \
+  <for each existing protected path P (root + depth ≤ 3 in writes): --ro-bind-fd $FD_P "$REPO/P"> \
+  --ro-bind "$CACHE/m2" "$CACHE/m2" \
+  --bind "$CACHE/npm" "$CACHE/npm" \
+  <containers only: --bind "$CACHE/containers" "$CACHE/containers"> \
+  --bind "$JOB" "$JOB" \
   --chdir "$REPO" \
   -- actionbox job-init --meta "$JOB/meta.json" -- <argv>
 ```
@@ -443,11 +465,12 @@ podman unshare -- bwrap \
 - `--ro-bind / /` replaces `--dev-bind / /` (R13). Persistence paths (`/var/tmp`, `/dev/shm`), external drives (`/media`, `/mnt`) and the Nix daemon socket are hidden behind tmpfs.
 - **Order matters:** later mounts shadow earlier ones [doc] bwrap(1). Protected paths come **after** writes dirs.
 - `/dev/net/tun` is needed by `slirp4netns` for container networking inside the sandbox. ⚠ O3
+- The fds must survive `podman unshare` into bwrap. ⚠ O10. If `podman unshare` closes them, the broker execs `podman unshare -- actionbox engine-exec …`, which opens the fds inside the namespace with the same `openat2` rules before exec'ing bwrap.
+- The project cache's `m2/` is read-only; a job's resolved artifacts land in `$JOB/m2` and are discarded with the job dir (R28).
 
 **`job-init`**
 1. Re-stats every recorded mount point and aborts on a `(dev, inode)` mismatch (R7).
 2. If `containers = true`:
-   - writes `$HOME/.docker-java.properties` with `api.version=1.40` (R10, ⚠ O2),
    - starts `podman system service --time=0 unix://$XDG_RUNTIME_DIR/podman.sock`,
    - waits for `/_ping`.
 3. Runs argv, then stops the service.
@@ -461,7 +484,7 @@ podman unshare -- bwrap \
 
 **Verification status**
 - Verified core: E9, E14 (`podman unshare` + bwrap, vfs, shared runroot, Postgres with `--user 999`).
-- Not yet verified: the R13 root layout, `--unshare-pid/ipc`, `--new-session`, `--clearenv`, toolchain binds, the API service under Podman 3.4, and non-container jobs under `podman unshare`. ⚠ O3, covered by §9.
+- Not yet verified: the R13 root layout, `--unshare-pid/ipc`, `--new-session`, `--clearenv`, toolchain binds, the API service under Podman 3.4, non-container jobs under `podman unshare`, bwrap 0.13.1 and `--bind-fd`. ⚠ O3, O10, covered by §9.
 
 ### 8.9 Coordinate fetch (owner-only, R11, R17)
 
@@ -470,7 +493,7 @@ Fetches run on the host, in an empty `mktemp -d` cwd, with the owner's normal cr
 | Ecosystem | Accepted format (anchored regex) | Command |
 |---|---|---|
 | Maven | See below | `mvn -B -ntp org.apache.maven.plugins:maven-dependency-plugin:3.11.0:get -Dartifact=<coord> -Dmaven.repo.local=<cache>/m2` |
-| npm | See below | `npm cache add <spec> --cache <cache>/npm` |
+| npm | See below | `npm cache add <spec> --cache <cache>/npm --min-release-age=<config> --allow-git=none --allow-remote=none` ⚠ O12 flag syntax |
 | Image | See below | `podman --root <store> --runroot <run> --storage-driver=vfs pull <ref>` |
 
 Accepted formats:
@@ -508,7 +531,11 @@ Fetch requests:
   1. prints every coordinate,
   2. asks y/N (`N` → `rejected`),
   3. takes the project lock,
-  4. runs argv arrays, never a shell.
+  4. runs argv arrays, never a shell,
+  5. appends every file the fetch added to the project cache, with its sha256, to `ledger.jsonl` (R29):
+     - Maven: files under `m2/` that changed during the fetch (snapshot of the tree before and after),
+     - npm: the `integrity` recorded by the npm cache index,
+     - image: the manifest digest, which is already part of the coordinate.
 
 Expect iterative round trips: an offline build fails → the agent requests the missing artifact → the owner fetches → the agent retries.
 
@@ -522,7 +549,7 @@ Expect iterative round trips: an offline build fails → the agent requests the 
 
 ## 9. Conformance & acceptance tests
 
-`actionbox conformance` runs P1–P12 in the engine twice, once with `containers = false` and once with `containers = true`. Run it before first use and after any Podman, bwrap or kernel upgrade.
+`actionbox conformance` runs P1–P13 in the engine twice, once with `containers = false` and once with `containers = true`. Run it before first use and after any Podman, bwrap or kernel upgrade.
 
 | ID | Probe | Expected |
 |---|---|---|
@@ -534,12 +561,13 @@ Expect iterative round trips: an offline build fails → the agent requests the 
 | P6 | TCP connect to a host-loopback service started by the test harness | Fail |
 | P7 | Socket inventory (E13 method) | Only `$JOB/xdg/podman.sock` (containers) or nothing |
 | P8 | Writes dir that is a symlink | Broker rejects before start |
-| P9 | Harness swaps a writes dir for a symlink to `$HOME` between broker check and mount | `job-init` aborts |
+| P9 | Harness swaps a writes dir for a symlink to `$HOME` between broker check and mount | The original dir is mounted (fd); `$HOME` is never writable |
+| P13 | Job writes into the project cache's `m2/` | Fail; the artifact lands in `$JOB/m2` |
 | P10 | Environment dump | Only the §8.7 variables; a harness-set `CANARY_TOKEN` absent |
 | P11 | Write `/var/tmp/x`, `/dev/shm/x`; list `/media`, `/mnt` | Writes don't persist after the job; mounts empty |
 | P12 | Resource limits: memory hog, fork bomb, sleep past timeout | `killed` / `timed_out`, host unaffected |
 | A1 | Containers: Postgres via Podman CLI (`pg-spike.sh`) | Ready + port reachable ✅ [obs-H] (old layout; re-run on §8.8) |
-| A2 | Containers: a real Testcontainers 2.x test from a project, `api.version=1.40` | Passes offline |
+| A2 | Containers: a real Testcontainers 2.x test from a project, no API pin (R27) | Passes offline; if not, retry with `api.version=1.40` |
 | A3 | Trust: the cases below | Only signed, genuine, clean, descendant passes |
 | A4 | Params: leading `-` without `allow_leading_dash`; unknown param; NUL; 257 bytes | Rejected, nothing runs |
 
@@ -571,10 +599,13 @@ A3 cases:
 
 | ID | Item | How to close |
 |---|---|---|
-| O2 | Testcontainers 2.x ↔ Podman 3.4 compat API with `api.version=1.40` via `~/.docker-java.properties` | A2 with a real project |
-| O3 | R13 root layout, `--unshare-pid/ipc`, `--clearenv`, `/dev/net/tun` bind, non-container jobs under `podman unshare` | Conformance P1–P12 + A1 re-run |
+| O2 | Testcontainers 2.x ↔ Podman 3.4 compat API, unpinned (R27) | A2 with a real project |
+| O3 | R13 root layout, `--unshare-pid/ipc`, `--clearenv`, `/dev/net/tun` bind, non-container jobs under `podman unshare`, bwrap 0.13.1 | Conformance P1–P13 + A1 re-run |
 | O5 | Forged objects, replace refs, grafts, `gpg.openpgp.program`, textconv against §8.4 | A3 |
 | O8 | Shared rootless pause process between host fetches and jobs | Observe during A1/A2; [inf] harmless, since bwrap adds its own mount namespace |
+| O10 | Do fds survive `podman unshare` into bwrap (R26)? | Spike; fallback `engine-exec` (§8.8) |
+| O11 | npm cache as the store: entries evicted or `npm ci --offline` writing to the cache unexpectedly | Observe during M4; move to verdaccio or a tarball dir if it bites |
+| O12 | npm 12 flag names/units for `min-release-age`, `allow-git`, `allow-remote` on `npm cache add` | `npm help config` on the installed npm |
 
 Closed in the refinement session:
 
@@ -610,9 +641,10 @@ Closed in the refinement session:
    - `serve`, socket protocol, shim;
    - `list_actions` / `run_action` / `job_status`;
    - `job-init` inode check, env allowlist, limits, lock;
-   - P1–P12 green with `containers = false`; A4 green.
-3. **M3 Containers:** Podman service in `job-init`, `api.version` pin; P1–P12 green with `containers = true`; A1 + A2 green.
-4. **M4 Fetch:** `request_fetch`, `fetch_status`, `actionbox fetch`.
+   - bwrap ≥ 0.13.1, fd binds (O10 spike first);
+   - P1–P13 green with `containers = false`; A4 green.
+3. **M3 Containers:** Podman service in `job-init`; P1–P13 green with `containers = true`; A1 + A2 green.
+4. **M4 Fetch:** `request_fetch`, `fetch_status`, `actionbox fetch`, fetch ledger, npm guards.
 5. **M5 Ops:** retention, event display, launcher integration (Q18).
 
 ## 14. References
@@ -620,7 +652,9 @@ Closed in the refinement session:
 | Topic | Sources |
 |---|---|
 | Fence | github.com/fencesandbox/fence (formerly Use-Tusk/fence), v0.1.67: `internal/sandbox/dangerous.go`, `internal/sandbox/linux.go`, `internal/config/config.go`, `docs/configuration.md` |
-| bubblewrap | man bwrap(1); NEWS (overlay options added in 0.11.0) |
+| bubblewrap | man bwrap(1); NEWS (`--bind-fd` 0.10.0, overlays 0.11.0, GHSA-pxhw-h44j-8pfx fixed 0.12.0, 0.13.1 2026-10-14) |
+| Maven | `maven.repo.local.tail` (3.9.0+), maven-resolver `local-repository.md` |
+| npm | npm/cli `definitions.js` (`min-release-age`, `allow-git`, `allow-remote`), `npm-cache.md` |
 | Podman | man podman-unshare(1), containers.conf(5), containers-storage.conf(5); v3.4.4 `version/version.go` (compat API 1.40) |
 | Testcontainers | 2.0.5 `DockerClientProviderStrategy.java` (API 1.44 with 1.32 fallback); PRs #11216, #11346; java.testcontainers.org/supported_docker_environment/ |
 | docker-java | `api.version` configuration (`DefaultDockerClientConfig`) |

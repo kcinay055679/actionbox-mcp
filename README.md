@@ -1,161 +1,176 @@
 # actionbox
 
-actionbox lets a sandboxed coding agent run a fixed set of build and test commands, such as `mvn test` or a linter, that the owner has defined and signed. Each run is isolated from secrets, the network and the rest of the host. The agent gets the tools it needs without the agent's sandbox being weakened.
+actionbox lets a sandboxed coding agent run a fixed set of build and test commands, such as `mvn test` or a linter, that you have defined and signed. Each run is isolated from your secrets, the network and the rest of your machine. The agent gets the tools it needs, and its own sandbox stays as strict as it is.
 
-The agent cannot invent commands. It picks an action from a list, supplies typed parameters, and receives the result.
+> **Status:** design phase. Nothing described here is implemented yet. [spec.md](spec.md) is the implementation spec.
 
-## How it fits together
+## Why
 
-```text
- Owner ──signs──► .agent-actions.toml (in the repo)
-                          │ verified on every request
- Agent ──MCP──► Shim ──► Broker ──► Job (isolated sandbox) ──► result
-                          ▲
- Owner ──CLI (fetch, run, verify)
+Claude Code runs inside [Fence](https://github.com/fencesandbox/fence) with a defensive policy: no Docker, no Maven, no network beyond what's allowed. That stops it from running tests, builds or Testcontainers.
+
+Loosening the sandbox would expose your secrets to anything the agent writes or gets talked into. actionbox keeps the sandbox closed and offers a small set of signed actions instead.
+
+## What you need
+
+| Requirement | Notes |
+|---|---|
+| Linux with cgroups v2 and unprivileged user namespaces | Tested on Pop!_OS 22.04 |
+| systemd user session | Enforces resource limits per job |
+| Podman (rootless) with a subuid/subgid range | Only for actions that start containers |
+| bubblewrap ≥ 0.13.1 | Older versions lack a symlink-escape fix; install from Nix or build locally |
+| GnuPG and a signing key | You sign the actions file with git |
+| Maven ≥ 3.9 / npm 12 | Only if your actions use them |
+| Claude Code inside Fence | Or any MCP client inside a sandbox that can reach a Unix socket |
+
+## How you use it
+
+### One-time setup
+
+1. Install the `actionbox` binary.
+2. Export your **public** GPG key into actionbox's keyring and set your key fingerprint in `~/.config/actionbox/config.toml`.
+3. Register each project by name and path in the same config.
+4. Tell actionbox where your toolchains live (JDK, Maven, Node).
+5. Register the MCP server for Claude Code:
+
+   ```bash
+   claude mcp add --scope user actionbox -- actionbox mcp
+   ```
+
+6. Run `actionbox conformance` once to check the isolation guarantees on your machine.
+
+### Define actions for a project
+
+Add `.agent-actions.toml` to the project root and commit it **signed**:
+
+```toml
+schema_version = 1
+
+[actions.test]
+description = "Run backend tests, optionally one class"
+invoker     = "agent"
+containers  = true
+argv        = ["mvn", "-o", "-B", "test", "-Dtest={test_class}"]
+writes      = ["target"]
+timeout     = "20m"
+[actions.test.params.test_class]
+pattern     = '[A-Za-z0-9_.#*]+'
+optional    = true
 ```
 
-1. The agent calls an MCP tool on the **shim**.
-2. The shim forwards the call to the **broker** on the host.
-3. The broker verifies the signature on the project's **definitions file**.
-4. The broker runs the requested **action** as a **job** in its own sandbox.
-5. Dependencies enter only through **fetches** that the owner approves.
+```bash
+git commit -S -m "add test action"
+actionbox verify
+```
 
-## Concepts
+To change actions, edit the file, make another signed commit, and run `actionbox verify`.
 
-### Owner and agent
+### Day to day
 
-The **owner** is the single person who defines actions, signs them and approves fetches. The **agent** is the coding agent running in its own sandbox. It can list and run actions and request dependencies, and nothing more.
+1. Start `actionbox serve` in a terminal **outside** the sandbox. It shows every job and dependency request. Pressing Ctrl-C takes away everything the agent can run.
+2. Work with the agent as usual. It sees the actions as MCP tools and runs them itself.
+3. When a build fails because a dependency is missing, the agent files a fetch request and `serve` shows it. You review and approve it:
 
-### Project
+   ```bash
+   actionbox fetch            # list pending requests
+   actionbox fetch <id>       # show coordinates, confirm, download
+   ```
 
-A repository registered in the broker's config. Unregistered repositories are never served. Any agent may call any registered project, since everything in it is signed by the owner.
+   The agent then retries.
 
-### Definitions file
+4. After upgrading Podman, bubblewrap or the kernel, run `actionbox conformance` again.
 
-`.agent-actions.toml` in the project root declares all actions. It is trusted only if all of these hold:
+## How it works
 
-- Its content is identical to the version in a commit signed by the owner's pinned key.
-- That commit and its contents are genuine, not forged.
-- That commit descends from the last trusted commit. This stops the agent from checking out an older version that still contains a since-removed action.
+```text
+ You ──signs──► .agent-actions.toml (in the repo)
+                         │ verified on every request
+ Agent ──MCP──► Shim ──► Broker ──► Job (isolated sandbox) ──► result
+                         ▲
+ You ──CLI (serve, fetch, run, verify)
+```
 
-If any check fails, every request for the project fails and nothing runs.
+1. The **agent** calls an MCP tool on the **shim**, a small MCP server that runs inside the agent's sandbox.
+2. The shim forwards the call over a Unix socket to the **broker** on your host.
+3. The broker checks that the project's **definitions file** matches a commit signed by your key.
+4. It starts the requested **action** as a **job** in a fresh sandbox.
+5. Dependencies enter only through **fetches** that you approve.
 
-To change actions: edit the file, then make a signed commit. Returning to older definitions requires an explicit `actionbox verify --accept <commit>`.
+### Trust
 
-### Action
+The broker serves only projects you registered. A definitions file is trusted only if all of these hold:
 
-A named command with typed parameters. Each action declares:
+- its content is identical to a commit signed by your key,
+- that commit and its contents are genuine (the broker re-checks git's object hashes itself),
+- that commit descends from the last trusted one.
 
-- **Invoker:** who may start it, `agent` or `owner`.
-- **Command:** an argv array, which may contain `{param}` placeholders.
-- **Writes dirs:** the only project directories it may modify.
-- **Containers:** whether it needs a container engine.
-- **Limits:** optional timeout and memory limits, capped by the owner's config.
+The last check stops the agent from checking out an old version that still contains an action you removed. Going back on purpose, for example to an older branch, needs `actionbox verify --accept <commit>`.
 
-Parameter handling:
+If any check fails, nothing runs.
 
-- Values must fully match their declared pattern.
-- Values are never word-split or interpreted by a shell.
-- An omitted optional parameter removes its whole argument.
+### Actions and parameters
 
-### Job
+An action is a command as a list of arguments, with typed parameters:
 
-A single run of a single action. Each project runs one job at a time; further jobs queue in arrival order. Every job has its own log and scratch directory, plus hard limits on time, memory, processes and CPU.
+- Parameter values must fully match the pattern you declared.
+- They can't start with `-` unless you allow it.
+- They are never passed through a shell.
 
-A job **can**:
+The agent can only pick an action and fill in its parameters; it can't change the command.
 
-- Read the project.
-- Write to its writes dirs and the project cache.
-- Start containers, if the action allows it. They are reachable on the job's own localhost, so Testcontainers works.
+### Jobs and isolation
 
-A job **cannot**:
+Each job runs in its own sandbox: a read-only view of the system, an empty home directory, no network and a clean environment. Each project runs one job at a time.
 
-- Reach any network, external or host localhost.
-- Read the home directory, keys, credentials or the owner's own caches.
-- Write protected paths, even inside a writes dir. Protected paths are `.git`, the definitions file, IDE, shell and tool config, and the Maven wrapper.
-- See host sockets or the owner's environment variables.
-- Leave anything behind outside its writes dirs, the project cache and its job dir.
-
-Jobs see the project live, not a snapshot. If the agent edits files while a job is running, the job sees the edits.
-
-### Fetch
-
-Jobs run offline, so missing dependencies go through the owner:
-
-1. The agent files a fetch request with exact coordinates.
-2. The owner reviews the request.
-3. The owner runs it on the host with their own credentials.
-4. The result lands in the project cache.
-
-No repository files are involved in a fetch.
-
-Expect a few rounds: the build fails offline, the agent requests the missing artifact, the owner fetches it, and the agent retries.
-
-### Project cache
-
-Per-project storage for Maven artifacts, npm packages and container images. Only jobs and fetches use it, never the owner's normal builds, so a poisoned cache cannot spread.
-
-### Broker and shim
-
-The **broker** runs on the host in a terminal. It is the only component that enforces anything.
-
-The **shim** is the MCP server inside the agent's sandbox. It only forwards calls and holds no trust. The agent could talk to the broker directly and would gain nothing.
-
-## Agent API (MCP tools)
-
-### `list_actions() → [{name, description, params}]`
-
-Returns the project's actions that the agent may start. If the definitions file is untrusted, this returns an error, not an empty list.
-
-### `run_action(name, params) → {job_id, state, exit_code?, output_tail?}`
-
-Starts a job. It is rejected without running anything if any of these apply:
-
-- The project is not registered.
-- The definitions file is not trusted.
-- The action is unknown, or only the owner may start it.
-- A parameter is unknown, doesn't fully match its pattern, exceeds 256 bytes, contains NUL, or starts with `-` without permission.
-
-The call waits up to 30 seconds. If the job hasn't finished by then, it returns `running` and the agent polls `job_status`.
-
-### `job_status(job_id) → {state, exit_code, output_tail, log_path}`
-
-- `state` is one of: `queued`, `running`, `succeeded`, `failed`, `timed_out`, `killed`, `rejected`.
-- `output_tail` holds the last 200 lines, up to 16 KiB.
-- The full log is readable at `log_path`.
-
-Output is untrusted text: it is capped but not sanitized.
-
-### `request_fetch(ecosystem, coordinates[]) → {request_id, state}`
-
-`ecosystem` is `maven`, `npm` or `image`. Only exact coordinates are accepted:
-
-| Ecosystem | Accepted format |
+| A job can | A job can't |
 |---|---|
-| Maven | `groupId:artifactId:version[:packaging[:classifier]]` |
-| npm | Package name with an exact version |
-| Image | Registry host plus an `@sha256` digest |
+| Read the project | Reach the network, external or your localhost |
+| Write the directories the action declares | Read your home dir, keys, credentials or your own caches |
+| Read the project's dependency cache | Write `.git`, the actions file, IDE, shell or tool config, even inside its writable dirs |
+| Start containers (if the action allows it) that it reaches on its own localhost, so Testcontainers works | See host sockets or your environment variables |
+| | Leave anything behind outside its writable dirs and job dir |
+| | Exceed its time, memory, process or CPU limits |
 
-Version ranges, tags and URLs are rejected.
+Jobs see the project live, so if the agent edits files while a job is running, the job sees those edits.
 
-### `fetch_status(request_id) → {state}`
+### Dependencies
 
-`state` is one of: `pending`, `fetched`, `rejected`, `expired`. A request expires after 24 hours.
+Jobs are offline. Each project has its own cache of Maven artifacts, npm packages and container images, separate from your normal `~/.m2` or `~/.npm`. Jobs can read the Maven cache but not write it.
 
-## Owner CLI
+The agent can only *request* dependencies, and only by exact coordinates: a Maven `g:a:v`, an npm package with an exact version, or an image with a digest. You approve each fetch. It runs on your host with your credentials, never touches repo files, and records a hash of every downloaded file.
 
-| Command | Description |
+## Reference
+
+### MCP tools (what the agent sees)
+
+| Tool | Purpose |
 |---|---|
-| `actionbox serve` | Runs in the foreground and shows jobs and fetch requests. Ctrl-C revokes all agent capabilities. |
-| `actionbox verify [project]` | Shows trust status. `--accept <commit>` overrides the rollback guard. |
-| `actionbox run <action>` | Runs any action, including owner-only ones. Works without `serve`. |
-| `actionbox fetch [id]` | Without an ID, lists pending requests. With an ID, shows every coordinate, asks for confirmation, and fetches. |
-| `actionbox conformance` | Verifies the isolation guarantees on this machine. Run it after upgrading sandbox tooling. |
+| `list_actions()` | Actions the agent may run, with their parameters |
+| `run_action(name, params)` | Starts a job; waits up to 30 s, then returns a job ID to poll |
+| `job_status(job_id)` | State, exit code, the last 200 lines of output, path to the full log |
+| `request_fetch(ecosystem, coordinates)` | Asks you to fetch dependencies (`maven`, `npm`, `image`) |
+| `fetch_status(request_id)` | `pending`, `fetched`, `rejected` or `expired` (after 24 h) |
 
-## Out of scope
+### CLI (what you use)
 
-- **Malicious dependencies:** they are contained within the job, not prevented.
-- **Agent-written code run outside actionbox:** for example an IDE import or the owner's own builds. Code review is the only control there.
-- **Build outputs:** jars and images are untrusted until the owner rebuilds them.
+| Command | Purpose |
+|---|---|
+| `actionbox serve` | Runs the broker in the foreground; Ctrl-C revokes everything |
+| `actionbox verify [project] [--accept <commit>]` | Shows trust status or accepts an older definitions commit |
+| `actionbox run <action>` | Runs any action yourself, including owner-only ones |
+| `actionbox fetch [id]` | Lists or approves fetch requests |
+| `actionbox conformance` | Checks the isolation guarantees on this machine |
+
+## What actionbox does not protect against
+
+- **Malicious dependencies:** they run inside the job, which contains them, but nothing prevents them.
+- **Agent-written code you run outside actionbox:** for example an IDE Maven import or your own builds. Review is the only control there.
+- **Build outputs:** jars and images built in jobs are untrusted until you rebuild them.
 - **Prompt injection through job output:** output is capped, not filtered.
-- **Multi-user setups.**
+- **Multiple users:** actionbox is built for one person.
+
+## Further reading
+
+- [spec.md](spec.md): implementation spec, decision log, tests
+- [GLOSSARY.md](GLOSSARY.md): terms
+- [docs/adr/](docs/adr/): architecture decisions
+- [docs/research/prior-art.md](docs/research/prior-art.md): related tools and what we reuse
