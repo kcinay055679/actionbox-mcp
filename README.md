@@ -36,7 +36,8 @@ Loosening the sandbox would expose your secrets to anything the agent writes or 
    claude mcp add --scope user actionbox -- actionbox mcp
    ```
 
-6. Run `actionbox conformance` once to check the isolation guarantees on your machine.
+6. Add the recommended write-denies to the agent's Fence config (spec §8.10).
+7. Run `actionbox conformance` once to check the isolation guarantees on your machine. It also warns if the agent's environment contains tokens or keys.
 
 ### Define actions for a project
 
@@ -134,7 +135,7 @@ Jobs see the project live, so if the agent edits files while a job is running, t
 
 ### Dependencies
 
-Jobs are offline. Each project has its own cache of Maven artifacts, npm packages and container images, separate from your normal `~/.m2` or `~/.npm`. Jobs can read the Maven cache but not write it.
+Jobs are offline. Each project has its own cache of Maven artifacts, npm packages and container images, separate from your normal `~/.m2` or `~/.npm`. Jobs can read these caches but never change them: a job's own downloads and container changes are thrown away with the job, so one job can't plant something for the next.
 
 The agent can only *request* dependencies, and only by exact coordinates: a Maven `g:a:v`, an npm package with an exact version, or an image with a digest. You approve each fetch. It runs on your host with your credentials, never touches repo files, and records a hash of every downloaded file.
 
@@ -156,6 +157,7 @@ The agent can only *request* dependencies, and only by exact coordinates: a Mave
 |---|---|
 | `actionbox serve` | Runs the broker in the foreground; Ctrl-C revokes everything |
 | `actionbox verify [project] [--accept <commit>]` | Shows trust status or accepts an older definitions commit |
+| `actionbox verify --log` | Checks that the event log of jobs and fetches hasn't been tampered with |
 | `actionbox run <action>` | Runs any action yourself, including owner-only ones |
 | `actionbox fetch [id]` | Lists or approves fetch requests |
 | `actionbox conformance` | Checks the isolation guarantees on this machine |
@@ -163,7 +165,15 @@ The agent can only *request* dependencies, and only by exact coordinates: a Mave
 ## What actionbox does not protect against
 
 - **Malicious dependencies:** they run inside the job, which contains them, but nothing prevents them.
-- **Agent-written code you run outside actionbox:** for example an IDE Maven import or your own builds. Review is the only control there.
+- **Agent-written files that something outside a sandbox runs later.** This is the main way agents escape sandboxes in practice. Examples:
+  - `.vscode/`, `.idea/` and the Maven/Gradle import your IDE runs,
+  - `.envrc` (direnv) and `mise.toml`,
+  - `.mvn/extensions.xml` and `mvnw`,
+  - `.git/hooks` and `.git/config`,
+  - `.claude/` and CI workflows.
+
+  Deny writes to them in the agent's Fence config (see spec §8.10) and review before you run anything the agent wrote.
+- **Other MCP servers in the same session:** if the agent can also write to GitHub, Slack or similar, it can pass job output on. Don't combine actionbox with outward-writing MCP servers in one session.
 - **Build outputs:** jars and images built in jobs are untrusted until you rebuild them.
 - **Prompt injection through job output:** output is capped, not filtered.
 - **Multiple users:** actionbox is built for one person.

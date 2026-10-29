@@ -34,6 +34,11 @@ memory_max = "8G"
 tasks_max = 4096
 cpu_quota = "400%"
 
+[fetch]
+npm_registry    = "https://registry.npmjs.org/"
+image_registries = ["docker.io", "ghcr.io"]
+env_passthrough = []
+
 [retention]
 jobs_per_project = 50
 max_age = "14d"
@@ -76,6 +81,11 @@ func TestLoadSpecSketch(t *testing.T) {
 		},
 		Caps:      defaultCaps,
 		Retention: Retention{JobsPerProject: 50, MaxAge: 14 * 24 * time.Hour},
+		Fetch: Fetch{
+			NPMRegistry:     "https://registry.npmjs.org/",
+			ImageRegistries: []string{"docker.io", "ghcr.io"},
+			EnvPassthrough:  []string{},
+		},
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("got  %+v\nwant %+v", cfg, want)
@@ -96,6 +106,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if len(cfg.Projects) != 0 {
 		t.Errorf("projects = %v, want none", cfg.Projects)
+	}
+	if cfg.Fetch.NPMRegistry != DefaultNPMRegistry || len(cfg.Fetch.ImageRegistries) != 0 {
+		t.Errorf("fetch = %+v, want default npm registry and no image registries", cfg.Fetch)
 	}
 }
 
@@ -129,6 +142,10 @@ func TestLoadRejects(t *testing.T) {
 		{name: "unknown key", toml: minimal + "extra = 1\n", wantMsg: "extra"},
 		{name: "unknown project key", toml: minimal + "[projects.a]\npath = \"/a\"\nrepo = \"x\"\n", wantMsg: "projects.a.repo"},
 		{name: "unknown limits key", toml: minimal + "[limits]\nnice = 5\n", wantMsg: "limits.nice"},
+		{name: "http npm registry", toml: minimal + "[fetch]\nnpm_registry = \"http://registry.npmjs.org/\"\n", wantMsg: "fetch.npm_registry"},
+		{name: "npm registry with credentials", toml: minimal + "[fetch]\nnpm_registry = \"https://u:p@r.example/\"\n", wantMsg: "fetch.npm_registry"},
+		{name: "image registry with scheme", toml: minimal + "[fetch]\nimage_registries = [\"https://docker.io\"]\n", wantMsg: "fetch.image_registries"},
+		{name: "invalid passthrough name", toml: minimal + "[fetch]\nenv_passthrough = [\"A-B\"]\n", wantMsg: "fetch.env_passthrough"},
 		{name: "missing fingerprint", toml: bwrap, wantMsg: "pinned_fingerprint"},
 		{name: "short fingerprint", toml: bwrap + `pinned_fingerprint = "ABCDEF"`, wantMsg: "pinned_fingerprint"},
 		{name: "non-hex fingerprint", toml: bwrap + `pinned_fingerprint = "` + strings.Repeat("G", 40) + `"`, wantMsg: "pinned_fingerprint"},

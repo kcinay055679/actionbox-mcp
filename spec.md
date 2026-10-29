@@ -7,11 +7,13 @@
   - Requirements session (grill-me method, Q1–Q21)
   - Refinement session (grill-with-docs, R1–R24)
   - Prior-art review (R25–R29)
+  - Practice review (R30–R36)
 - **Related:**
   - [README.md](README.md): user-facing contract
   - [GLOSSARY.md](GLOSSARY.md): terms
   - [docs/adr/](docs/adr/): ADR 0001 (single engine), ADR 0002 (trust check)
   - [docs/research/prior-art.md](docs/research/prior-art.md): existing tools
+  - [docs/research/practice.md](docs/research/practice.md): how people run agents in practice, known attacks
 
 Terms (owner, project, action, job, engine, broker, shim, fetch request, fetch, trusted commit, writes dir, protected path, project cache) are used as defined in GLOSSARY.md.
 
@@ -145,6 +147,22 @@ The goal is a **fixed, per-project set of actions** that the agent can invoke an
 | R28 | Project cache in jobs | Maven: project cache mounted **read-only** as `maven.repo.local.tail`, writable per-job head in the job dir. npm: cache stays writable, behavior observed (O11) | Jobs can't poison the Maven cache; npm cache gives "no guarantee" of keeping entries [doc] | Writable Maven cache; verdaccio now |
 | R29 | Fetch guards | Each fetch records the sha256 of every fetched file next to its coordinate in a per-project fetch ledger; npm fetches set `min-release-age` and keep `allow-git` / `allow-remote` at `none` | Ledger makes the cache auditable (Nix fixed-output idea); cheap npm supply-chain guards | No record |
 
+### 5.4 Practice review (R30–R36)
+
+Source: [docs/research/practice.md](docs/research/practice.md). Most of its claims come from search-engine summaries; re-check before citing.
+
+| # | Question | Decision | Why | Rejected |
+|---|---|---|---|---|
+| R30 | What the broker reads | **Invariant:** broker and fetch read only the verified definitions blob, the owner's config and owner files under `$HOME` (`settings.xml`, `.npmrc` for credentials). Never any agent-writable project file (`.mvn/`, `.npmrc`, `package.json`, lockfiles, …) | 2026 attacks hand off agent-written files to a process outside the sandbox | — |
+| R31 | State shared between jobs | Jobs never write state a later job relies on. npm cache read-only (closes O11's write half). Container store mounted as an overlay: project store read-only lower, `$JOB` upper, discarded after the job. Fallback if the overlay fails (O13): writable store, plus an image-digest comparison after every job | Clinejection (2026-03) poisoned a shared cache to reach a privileged later run | Writable shared caches |
+| R32 | Agent-written files run outside actionbox | Listed explicitly in README and §10; §8.10 recommends Fence write-denies for them | They are the main remaining escape path | Leave implicit |
+| R33 | Audit trail | Append-only, hash-chained event log of every job and fetch decision | Cheap; needed after an incident | No log |
+| R34 | Fetch hardening | Fetch only from registries in config; flag unusual coordinates at the y/N prompt; nothing executes during fetch; minimal environment | Fetch is the only network path left | — |
+| R35 | Combined MCP servers | Residual risk: job output plus an outward-writing MCP server (GitHub, Slack) can leak data; don't combine them in one session | GitHub MCP attack (2025-05) | — |
+| R36 | Secrets in the agent's environment | `conformance` warns about token- or key-like variables in the shim's environment | Cheap check of the agent-side setup | Hard failure |
+
+Not adopted: secret scanning of job output (jobs hold no secrets) and prompt-injection filtering (detection isn't a security boundary).
+
 ## 6. What we tried
 
 | # | Experiment | Env | Result |
@@ -226,6 +244,7 @@ The agent's Fence must **not** have write access to any of these.
 | `~/.local/share/actionbox/projects/<name>/containers/{store,run}/` | Podman graphroot + runroot (always used as a pair) |
 | `~/.local/share/actionbox/projects/<name>/lock` | `flock` target: one job or fetch at a time per project |
 | `~/.local/state/actionbox/broker.sock` | Socket (agent needs connect only) |
+| `~/.local/state/actionbox/events.jsonl` | Event log (R33): append-only, one JSON object per line, each with `prev` = sha256 of the previous line |
 | `~/.local/state/actionbox/trust/<name>.json` | Trusted commit (rollback guard) |
 | `~/.local/state/actionbox/fetch/<request_id>.json` | Fetch requests |
 | `~/.local/state/actionbox/jobs/<name>/<job>/` | `log.txt`, `meta.json` (agent needs read), `xdg/`, `tmp/`, `home/` |
@@ -250,6 +269,11 @@ timeout = "30m"
 memory_max = "8G"
 tasks_max = 4096
 cpu_quota = "400%"
+
+[fetch]             # R34
+npm_registry    = "https://registry.npmjs.org/"   # default; https only, no credentials in the URL
+image_registries = ["docker.io", "ghcr.io"]      # default empty: image fetches fail closed
+env_passthrough = []    # extra variables a fetch may see; default none
 
 [retention]
 jobs_per_project = 50
@@ -451,7 +475,13 @@ Notes:
    | `[toolchain].env` | e.g. `JAVA_HOME` |
    | Container jobs only | `XDG_RUNTIME_DIR`, `CONTAINERS_CONF`, `CONTAINERS_STORAGE_CONF`, `DOCKER_HOST`, `TESTCONTAINERS_RYUK_DISABLED=true` |
 
-6. **Retention (R20).** After each job, and at `serve` startup, prune `jobs/<name>/`. Keep the newest `jobs_per_project` and drop anything older than `max_age`.
+   | npm extras | `npm_config_logs_dir=$JOB/tmp`, `npm_config_update_notifier=false` (read-only cache, R31) |
+
+6. **Event log (R33).** Append to `events.jsonl` before and after each job: `{ts, kind: "job_start"|"job_end", project, job_id, action, params, definitions_commit, state, exit_code, prev}`. Fetch decisions are logged the same way (§8.9).
+   - Writes are serialized with a `flock` on the log file.
+   - `prev` is the sha256 of the previous line's bytes; the first line uses 64 zeros.
+   - `actionbox verify --log` re-checks the chain.
+7. **Retention (R20).** After each job, and at `serve` startup, prune `jobs/<name>/`. Keep the newest `jobs_per_project` and drop anything older than `max_age`. The event log is never pruned.
 
 ### 8.8 Engine (R3, R13, R14, R25, R26, ADR 0001)
 
@@ -469,8 +499,9 @@ podman unshare -- "$BWRAP_PATH" \
   <for each writes dir D: --bind-fd $FD_D "$REPO/D"> \
   <for each existing protected path P (root + depth ≤ 3 in writes): --ro-bind-fd $FD_P "$REPO/P"> \
   --ro-bind "$CACHE/m2" "$CACHE/m2" \
-  --bind "$CACHE/npm" "$CACHE/npm" \
-  <containers only: --bind "$CACHE/containers" "$CACHE/containers"> \
+  --ro-bind "$CACHE/npm" "$CACHE/npm" \
+  <containers only: --overlay-src "$CACHE/containers" \
+                    --overlay "$JOB/ovl/upper" "$JOB/ovl/work" "$CACHE/containers"> \
   --bind "$JOB" "$JOB" \
   --chdir "$REPO" \
   -- actionbox job-init --meta "$JOB/meta.json" -- <argv>
@@ -482,6 +513,8 @@ podman unshare -- "$BWRAP_PATH" \
 - `/dev/net/tun` is needed by `slirp4netns` for container networking inside the sandbox. ⚠ O3
 - The fds must survive `podman unshare` into bwrap. ⚠ O10. If `podman unshare` closes them, the broker execs `podman unshare -- actionbox engine-exec …`, which opens the fds inside the namespace with the same `openat2` rules before exec'ing bwrap.
 - The project cache's `m2/` is read-only; a job's resolved artifacts land in `$JOB/m2` and are discarded with the job dir (R28).
+- The npm cache is read-only; `npm ci --offline` reads tarballs by integrity and needs no writes (docs/research/npm-fetch.md). Jobs must use `npm ci`, not `npm install`, which appends index lines.
+- The container store (graphroot + runroot) is an overlay (R31, bwrap ≥ 0.11 `--overlay`): the project store is the read-only lower layer, writes land in `$JOB/ovl/upper` and are discarded with the job dir. Whether Podman's vfs driver and its locks work on overlayfs inside `podman unshare` is unverified. ⚠ O13. Fallback: plain `--bind` of the store, plus a digest comparison of all images (`podman images --digests`) before and after the job; any change fails the job and is logged.
 
 **`job-init`**
 1. Re-stats every recorded mount point and aborts on a `(dev, inode)` mismatch (R7).
@@ -503,7 +536,22 @@ podman unshare -- "$BWRAP_PATH" \
 
 ### 8.9 Coordinate fetch (owner-only, R11, R17)
 
-Fetches run on the host, in an empty `mktemp -d` cwd, with the owner's normal credentials and **no repo files involved**.
+Fetches run on the host, in an empty `mktemp -d` cwd, with the owner's normal credentials and **no repo files involved** (R30).
+
+**Hardening (R34)**
+- **Registries:**
+  - npm: `--registry` from `[fetch].npm_registry`.
+  - Images: the registry host must be in `[fetch].image_registries`.
+  - Maven: the repositories from the owner's `settings.xml`, an owner file.
+- **Nothing executes:**
+  - `npm cache add` runs no package scripts.
+  - Maven runs only the pinned `dependency:get` goal in an empty directory, with no project and no extensions.
+  - `podman pull` runs no image content.
+- **Environment:** fetch processes start from an empty environment plus `PATH`, `HOME`, `LANG` and `[fetch].env_passthrough`.
+- **Unusual coordinates** are flagged next to the y/N prompt but don't block. They are:
+  - a groupId, npm scope or image repository never fetched for this project (per `ledger.jsonl`),
+  - a name longer than 50 characters or mostly digits/random-looking,
+  - an npm version younger than twice `npm_min_release_age`.
 
 | Ecosystem | Accepted format (anchored regex) | Command |
 |---|---|---|
@@ -546,7 +594,7 @@ Fetch requests:
   1. prints every coordinate,
   2. asks y/N (`N` → `rejected`),
   3. takes the project lock,
-  4. runs argv arrays, never a shell,
+  4. runs argv arrays, never a shell, and logs the decision and result to `events.jsonl` (R33),
   5. appends every file the fetch added to the project cache, with its integrity, to `ledger.jsonl` (R29):
      - Maven: sha256 of the files under `m2/` that changed during the fetch (snapshot of the tree before and after),
      - npm: `integrity` and `size` of the `pacote:tarball:<spec>` entry among the new `_cacache/index-v5` lines (before/after snapshot); `npm cache ls` prints keys only,
@@ -561,10 +609,17 @@ Expect iterative round trips: an offline build fails → the agent requests the 
 - Keep `allowGitConfig` unset (false). This keeps `.git/config` write-protected for the agent [src].
 - No `allowUnixSockets` needed; it's a no-op on Linux (E11).
 - The agent's Fence must be able to read `~/.local/state/actionbox/jobs/` for `log_path`.
+- **Recommended write-denies (R32).** These files are written by the agent but run by something outside any sandbox. Fence already protects some by default (`.vscode`, `.idea`, `.git/hooks`, `.git/config`, `.mcp.json`, shell rc files). Add the rest to `denyWrite`:
+  - `.envrc` (direnv),
+  - `mise.toml`, `.mise.toml`, `.tool-versions` (mise),
+  - `.mvn/`, `mvnw`, `mvnw.cmd` (Maven extensions and wrapper, run on IDE import),
+  - `.claude/` (Claude Code settings and hooks),
+  - `.github/workflows/` (CI with secrets), if the agent shouldn't change CI at all.
+- **One outward-writing MCP server per session at most (R35):** don't give the same agent session actionbox together with an MCP server that can write outside, such as GitHub or Slack.
 
 ## 9. Conformance & acceptance tests
 
-`actionbox conformance` runs P1–P13 in the engine twice, once with `containers = false` and once with `containers = true`. Run it before first use and after any Podman, bwrap or kernel upgrade.
+`actionbox conformance` runs P1–P16 in the engine twice, once with `containers = false` and once with `containers = true`. Run it before first use and after any Podman, bwrap or kernel upgrade.
 
 | ID | Probe | Expected |
 |---|---|---|
@@ -578,6 +633,9 @@ Expect iterative round trips: an offline build fails → the agent requests the 
 | P8 | Writes dir that is a symlink | Broker rejects before start |
 | P9 | Harness swaps a writes dir for a symlink to `$HOME` between broker check and mount | The original dir is mounted (fd); `$HOME` is never writable |
 | P13 | Job writes into the project cache's `m2/` | Fail; the artifact lands in `$JOB/m2` |
+| P14 | Job writes into the project cache's `npm/` | Fail |
+| P15 | Container job pulls/tags/removes images and writes container layers | Project store byte-identical after the job (overlay) or job fails on digest change (fallback) |
+| P16 | Environment of the shim (run from the agent's Fence) | Warning for token- or key-like variable names (`*TOKEN*`, `*SECRET*`, `*KEY*`, `AWS_*`, `GH_*`); not a failure (R36) |
 | P10 | Environment dump | Only the §8.7 variables; a harness-set `CANARY_TOKEN` absent |
 | P11 | Write `/var/tmp/x`, `/dev/shm/x`; list `/media`, `/mnt` | Writes don't persist after the job; mounts empty |
 | P12 | Resource limits: memory hog, fork bomb, sleep past timeout | `killed` / `timed_out`, host unaffected |
@@ -585,6 +643,8 @@ Expect iterative round trips: an offline build fails → the agent requests the 
 | A2 | Containers: a real Testcontainers 2.x test from a project, no API pin (R27) | Passes offline; if not, retry with `api.version=1.40` |
 | A3 | Trust: the cases below | Only signed, genuine, clean, descendant passes |
 | A4 | Params: leading `-` without `allow_leading_dash`; unknown param; NUL; 257 bytes | Rejected, nothing runs |
+| A5 | Fetch with the project directory unreadable (`chmod 000`) | Fetch succeeds: proves R30 |
+| A6 | Tamper with one line of `events.jsonl` | `actionbox verify --log` reports the first broken line |
 
 A3 cases:
 
@@ -612,6 +672,8 @@ A3 cases:
 - **Prompt injection through output**: capped, not prevented. The agent already reads untrusted repo content.
 - **Kernel attack surface**: unprivileged user namespaces (bwrap, `podman unshare`).
 - **Cross-project calls (R4)**: any agent can run agent-invokable actions of any registered project.
+- **Handoff files (R32)**: files the agent writes and something outside a sandbox later runs. Examples: `.vscode/`, `.idea/`, `.envrc`, `mise.toml`, `.mvn/extensions.xml`, `mvnw`, `.git/hooks`, `.git/config`, `.claude/`, CI workflows, and the build itself on IDE Maven/Gradle import. Mitigated only by the agent's Fence write-denies (§8.10) and owner review. Practice shows this is the main 2026 escape class (docs/research/practice.md).
+- **Combined MCP servers (R35)**: job output read by the agent, plus another MCP server that can write outside (GitHub, Slack), is a way to leak data.
 - **Live repo (R16)**: a job may see a mix of two states of the code if the agent edits during the run. This affects correctness only, not isolation.
 - **SHA-1**: trust relies on SHA-1 collision resistance of the object IDs referenced from the signed commit.
 - **Threat C**: a malicious dependency fetched by coordinates runs inside the job only, which is the intended containment. If the owner uses the same dependency in normal builds, that's ordinary supply-chain risk.
@@ -621,11 +683,12 @@ A3 cases:
 | ID | Item | How to close |
 |---|---|---|
 | O2 | Testcontainers 2.x ↔ Podman 3.4 compat API, unpinned (R27) | A2 with a real project |
-| O3 | R13 root layout, `--unshare-pid/ipc`, `--clearenv`, `/dev/net/tun` bind, non-container jobs under `podman unshare`, bwrap 0.13.1 | Conformance P1–P13 + A1 re-run |
+| O3 | R13 root layout, `--unshare-pid/ipc`, `--clearenv`, `/dev/net/tun` bind, non-container jobs under `podman unshare`, bwrap 0.13.1 | Conformance P1–P16 + A1 re-run |
 | O5 | Go implementation of §8.4 against the A3 fixtures. The attacks themselves are reproduced and the algorithm passed with a throwaway reference implementation ([trust-attacks.md](docs/research/trust-attacks.md)) | A3 in Go (M1) |
 | O8 | Shared rootless pause process between host fetches and jobs | Observe during A1/A2; [inf] harmless, since bwrap adds its own mount namespace |
 | O10 | Do fds survive `podman unshare` into bwrap (R26)? | Spike; fallback `engine-exec` (§8.8) |
-| O11 | npm cache as the store: entries evicted or `npm ci --offline` writing to the cache unexpectedly | Observe during M4; move to verdaccio or a tarball dir if it bites |
+| O11 | npm cache as the store: entries evicted (writes are settled, R31) | Observe during M4; move to verdaccio or a tarball dir if it bites |
+| O13 | Container store as bwrap overlay under `podman unshare`: vfs driver, locks, runroot on overlayfs; unprivileged overlay needs kernel ≥ 5.11 | P15; fallback digest check (§8.8) |
 
 Closed in the refinement session:
 
@@ -663,9 +726,10 @@ Closed in the refinement session:
    - `list_actions` / `run_action` / `job_status`;
    - `job-init` inode check, env allowlist, limits, lock;
    - bwrap ≥ 0.13.1, fd binds (O10 spike first);
-   - P1–P13 green with `containers = false`; A4 green.
-3. **M3 Containers:** Podman service in `job-init`; P1–P13 green with `containers = true`; A1 + A2 green.
-4. **M4 Fetch:** `request_fetch`, `fetch_status`, `actionbox fetch`, fetch ledger, npm guards.
+   - event log (R33);
+   - P1–P16 green with `containers = false`; A4, A6 green.
+3. **M3 Containers:** Podman service in `job-init`, store overlay (O13); P1–P16 green with `containers = true`; A1 + A2 green.
+4. **M4 Fetch:** `request_fetch`, `fetch_status`, `actionbox fetch`, fetch ledger, npm guards, registry allowlist and coordinate flags (R34); A5 green.
 5. **M5 Ops:** retention, event display, launcher integration (Q18).
 
 ## 14. References

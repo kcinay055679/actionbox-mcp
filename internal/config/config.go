@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -24,7 +25,10 @@ var (
 	DefaultRetention = Retention{JobsPerProject: 50, MaxAge: 14 * 24 * time.Hour}
 )
 
-const DefaultNPMMinReleaseAgeDays = 7
+const (
+	DefaultNPMMinReleaseAgeDays = 7
+	DefaultNPMRegistry          = "https://registry.npmjs.org/"
+)
 
 type Config struct {
 	PinnedFingerprint    string
@@ -34,6 +38,7 @@ type Config struct {
 	Toolchain            Toolchain
 	Caps                 limits.Limits
 	Retention            Retention
+	Fetch                Fetch
 }
 
 type Project struct {
@@ -52,6 +57,12 @@ type Retention struct {
 	MaxAge         time.Duration
 }
 
+type Fetch struct {
+	NPMRegistry     string
+	ImageRegistries []string
+	EnvPassthrough  []string
+}
+
 type rawConfig struct {
 	PinnedFingerprint    string                `toml:"pinned_fingerprint"`
 	BwrapPath            string                `toml:"bwrap_path"`
@@ -60,6 +71,7 @@ type rawConfig struct {
 	Toolchain            rawToolchain          `toml:"toolchain"`
 	Limits               limits.Spec           `toml:"limits"`
 	Retention            rawRetention          `toml:"retention"`
+	Fetch                rawFetch              `toml:"fetch"`
 }
 
 type rawProject struct {
@@ -72,6 +84,12 @@ type rawToolchain struct {
 	Path    []string          `toml:"path"`
 }
 
+type rawFetch struct {
+	NPMRegistry     string   `toml:"npm_registry"`
+	ImageRegistries []string `toml:"image_registries"`
+	EnvPassthrough  []string `toml:"env_passthrough"`
+}
+
 type rawRetention struct {
 	JobsPerProject *int   `toml:"jobs_per_project"`
 	MaxAge         string `toml:"max_age"`
@@ -81,11 +99,13 @@ var (
 	fingerprintPattern = regexp.MustCompile(`^[0-9A-Fa-f]{40}$`)
 	projectNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 	envNamePattern     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	registryPattern    = regexp.MustCompile(`^[a-z0-9.-]+(:[0-9]+)?$`)
 )
 
 // set by engine itself, spec §8.7 step 5
 var reservedEnv = []string{
 	"PATH", "HOME", "LANG", "TERM", "TMPDIR", "MAVEN_OPTS", "npm_config_cache",
+	"npm_config_logs_dir", "npm_config_update_notifier",
 	"XDG_RUNTIME_DIR", "CONTAINERS_CONF", "CONTAINERS_STORAGE_CONF", "DOCKER_HOST", "TESTCONTAINERS_RYUK_DISABLED",
 }
 
@@ -135,6 +155,9 @@ func parse(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("limits.%w", err)
 	}
 	if cfg.Retention, err = parseRetention(raw.Retention); err != nil {
+		return nil, err
+	}
+	if cfg.Fetch, err = parseFetch(raw.Fetch); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -264,4 +287,29 @@ func (c *Config) ProjectForDir(dir string) (string, Project, bool) {
 
 func (c *Config) ClampLimits(l limits.Limits) limits.Limits {
 	return c.Caps.Clamp(l)
+}
+
+// no image registries by default: image fetches fail closed until the owner lists one
+func parseFetch(raw rawFetch) (Fetch, error) {
+	f := Fetch{NPMRegistry: DefaultNPMRegistry}
+	if raw.NPMRegistry != "" {
+		u, err := url.Parse(raw.NPMRegistry)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
+			return f, fmt.Errorf("fetch.npm_registry: want an https URL without credentials, got %q", raw.NPMRegistry)
+		}
+		f.NPMRegistry = raw.NPMRegistry
+	}
+	for _, r := range raw.ImageRegistries {
+		if !registryPattern.MatchString(r) {
+			return f, fmt.Errorf("fetch.image_registries: invalid registry host %q", r)
+		}
+	}
+	f.ImageRegistries = raw.ImageRegistries
+	for _, name := range raw.EnvPassthrough {
+		if !envNamePattern.MatchString(name) {
+			return f, fmt.Errorf("fetch.env_passthrough: invalid variable name %q", name)
+		}
+	}
+	f.EnvPassthrough = raw.EnvPassthrough
+	return f, nil
 }

@@ -68,4 +68,14 @@ The owner reviewing and executing a fetch request on the host, filling the proje
 _Avoid_: download, install
 
 **Project cache**:
-Per-project dependency and image storage that only jobs and fetches use, never the owner's normal builds.
+Per-project dependency and image storage that fetches fill and jobs only read, never the owner's normal builds.
+
+### Audit and risk
+
+**Event log**:
+The tamper-evident record of every job and every fetch decision.
+_Avoid_: audit trail, history
+
+**Handoff file**:
+A file the agent can write that something outside any sandbox later runs, such as IDE config, `.envrc` or `mvnw`.
+_Avoid_: dangerous file
