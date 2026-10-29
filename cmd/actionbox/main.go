@@ -17,6 +17,8 @@ commands:
   mcp                                    MCP server for the agent (stdio), forwards to serve
   verify [project] [--accept <commit>]   check and record a project's trusted definitions
   verify --log                           check the event log's hash chain
+  run <action> [name=value...]           run any action yourself (also owner-only), without serve
+  conformance [--agent-env]              check the isolation guarantees on this machine
 `
 
 func main() {
@@ -38,9 +40,16 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		err = runMCP(ctx, args[1:], stdin, stdout)
 	case "verify":
 		err = runVerify(ctx, args[1:], stdout)
+	case "run":
+		return runExitCode(runRun(ctx, args[1:], stdout), stderr)
+	case "conformance":
+		err = runConformance(ctx, args[1:], stdout)
 	case "job-init":
 		// internal: runs inside the job sandbox, its exit code is the job's
 		return runJobInit(ctx, args[1:], stderr)
+	case "probe":
+		// internal: conformance probes, run inside the job sandbox
+		return runProbe(ctx, args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return 0

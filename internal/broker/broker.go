@@ -16,6 +16,7 @@ import (
 	"actionbox/internal/config"
 	"actionbox/internal/definitions"
 	"actionbox/internal/job"
+	"actionbox/internal/jobrun"
 	"actionbox/internal/limits"
 	"actionbox/internal/protocol"
 	"actionbox/internal/trust"
@@ -27,10 +28,7 @@ const (
 	DefaultRequestTimeout = 30 * time.Second
 )
 
-// eventlog adds prev hash chain itself (§8.7 step 6)
-type Events interface {
-	Append(event any) error
-}
+type Events = jobrun.Events
 
 type VerifyFunc func(ctx context.Context, env verify.Env, name string) (verify.Outcome, error)
 
@@ -46,23 +44,12 @@ type Options struct {
 	PeerUID        func(net.Conn) (int, error)
 }
 
-type Event struct {
-	TS                time.Time         `json:"ts"`
-	Kind              string            `json:"kind"`
-	Project           string            `json:"project"`
-	JobID             string            `json:"job_id,omitempty"`
-	Action            string            `json:"action"`
-	Params            map[string]string `json:"params"`
-	DefinitionsCommit string            `json:"definitions_commit,omitempty"`
-	State             protocol.JobState `json:"state"`
-	ExitCode          *int              `json:"exit_code"`
-	Detail            string            `json:"detail,omitempty"`
-}
+type Event = jobrun.Event
 
 const (
-	EventJobStart    = "job_start"
-	EventJobEnd      = "job_end"
-	EventJobRejected = "job_rejected"
+	EventJobStart    = jobrun.EventJobStart
+	EventJobEnd      = jobrun.EventJobEnd
+	EventJobRejected = jobrun.EventJobRejected
 )
 
 type Broker struct {
@@ -102,27 +89,17 @@ func New(opts Options) *Broker {
 	}
 	cfg := opts.Env.Config
 	b := &Broker{
-		opts:   opts,
-		caps:   cfg.Caps.WithDefaults(config.DefaultCaps),
-		active: map[string]*entry{},
-		queues: map[string][]*entry{},
-		busy:   map[string]bool{},
-		retention: config.Retention{
-			JobsPerProject: positiveOr(cfg.Retention.JobsPerProject, config.DefaultRetention.JobsPerProject),
-			MaxAge:         positiveOr(cfg.Retention.MaxAge, config.DefaultRetention.MaxAge),
-		},
+		opts:      opts,
+		caps:      jobrun.CapsFor(cfg),
+		retention: jobrun.RetentionFor(cfg),
+		active:    map[string]*entry{},
+		queues:    map[string][]*entry{},
+		busy:      map[string]bool{},
 	}
 	for name := range cfg.Projects {
 		b.prune(name)
 	}
 	return b
-}
-
-func positiveOr[T int | time.Duration](v, d T) T {
-	if v <= 0 {
-		return d
-	}
-	return v
 }
 
 func (b *Broker) Serve(ctx context.Context, l net.Listener) error {
@@ -208,6 +185,7 @@ func (b *Broker) reject(req protocol.Request, project, commit, msg string) proto
 		Kind:              EventJobRejected,
 		Project:           project,
 		Action:            req.Name,
+		Invoker:           definitions.InvokerAgent,
 		Params:            req.Params,
 		DefinitionsCommit: commit,
 		State:             protocol.JobRejected,
@@ -245,7 +223,7 @@ func (b *Broker) runAction(ctx context.Context, req protocol.Request, project co
 	case <-timer.C:
 	case <-ctx.Done():
 	}
-	return protocol.Response{Job: b.view(e.snapshot(&b.mu))}
+	return protocol.Response{Job: b.view(e.job.Record())}
 }
 
 func (b *Broker) appendEvent(ev Event) {

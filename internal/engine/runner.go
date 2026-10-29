@@ -31,6 +31,8 @@ type Runner struct {
 	now     func() time.Time
 	// run starts cmd and waits; an error means it could not be started or waited for.
 	run func(cmd *exec.Cmd) (syscall.WaitStatus, error)
+	// AfterBinds runs after the binds are opened, right before exec; conformance P9 swaps a writes dir here.
+	AfterBinds func()
 }
 
 var _ job.Runner = (*Runner)(nil)
@@ -99,6 +101,9 @@ func (r *Runner) Run(ctx context.Context, spec job.Spec, output io.Writer) (job.
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = cancelWaitDelay
 
+	if r.AfterBinds != nil {
+		r.AfterBinds()
+	}
 	start := r.now()
 	status, err := r.run(cmd)
 	if err != nil {

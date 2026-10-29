@@ -347,7 +347,7 @@ kind        = "coordinate-fetch"
 - The broker opens the project root, then each writes dir and each existing protected path relative to it, with `openat2(…, O_PATH|O_NOFOLLOW, RESOLVE_NO_SYMLINKS)`. Any symlink component fails the job before start.
 - It creates missing writes dirs the same way (`mkdirat` on the parent fd).
 - bwrap binds **from those fds** (`--bind-fd FD DEST`, `--ro-bind-fd FD DEST`). It mounts via `/proc/self/fd/N`, then compares the fd's `(dev, inode)` with the mounted dest and dies with "Race condition binding dirfd" on a mismatch. It closes the fd afterwards, so it doesn't leak into the job [src] bubblewrap v0.13.1 `bubblewrap.c` L1150–1308. A path swapped after the check is therefore never mounted.
-- Backstop: each fd's `(dev, inode)` is recorded in `meta.json`. After mounting, `job-init` re-stats each mount point and aborts on a mismatch. This duplicates bwrap's own check and stays because it's cheap.
+- Backstop: each fd's `(dev, inode)` is recorded in `meta.json`. After mounting, `job-init` re-stats each mount point and aborts on a mismatch. This is a real guard, not only a duplicate: if the dest itself was swapped for a symlink, bwrap's mount follows it and its fd-vs-dest check can pass, while job-init's `lstat`-based recheck catches it.
 
 **Limits**
 - Optional per action, clamped to the caps in `config.toml`.
@@ -457,11 +457,11 @@ Notes:
 
    ```bash
    systemd-run --user --scope --quiet --collect \
-     -p MemoryMax=… -p TasksMax=… -p CPUQuota=… -- \
+     -p MemoryMax=… -p MemorySwapMax=0 -p TasksMax=… -p CPUQuota=… -- \
    timeout --kill-after=30s <timeout> <engine command (§8.8)>
    ```
 
-   [doc] systemd-run(1), systemd.resource-control(5). Defaults: 30 min, `MemoryMax=8G`, `TasksMax=4096`, `CPUQuota=400%`.
+   [doc] systemd-run(1), systemd.resource-control(5). Defaults: 30 min, `MemoryMax=8G`, `TasksMax=4096`, `CPUQuota=400%`. `MemorySwapMax=0`, else a job swaps instead of hitting its memory limit. `TasksMax` counts threads, and `podman unshare`, `job-init` and the podman service already use several each, so a per-action `tasks_max` far below ~100 can break job start.
 5. **Environment (R21).** The engine starts from `--clearenv` and sets only:
 
    | Variable | Value |
@@ -642,10 +642,10 @@ Expect iterative round trips: an offline build fails → the agent requests the 
 | P4 | Read `~/.ssh/*`, `~/.gnupg/*`, `~/.m2/settings.xml`, `~/.npmrc`, `~/.docker/config.json` | Fail / absent |
 | P5 | TCP connect to an external host | Fail |
 | P6 | TCP connect to a host-loopback service started by the test harness | Fail |
-| P7 | Socket inventory (E13 method) | Only `$JOB/xdg/podman.sock` (containers) or nothing |
+| P7 | Socket inventory (E13 method) | Only `$JOB/xdg/podman.sock` (containers) or nothing; container mode may also show sockets under the overlaid runroot |
 | P8 | Writes dir that is a symlink | Broker rejects before start |
-| P9 | Harness swaps a writes dir for a symlink to `$HOME` between broker check and mount | The original dir is mounted (fd); `$HOME` is never writable |
-| P13 | Job writes into the project cache's `m2/` | Fail; the artifact lands in `$JOB/m2` |
+| P9 | Harness swaps a writes dir for a symlink to a victim dir after binds are opened, just before exec (`engine.Runner.AfterBinds`) | Write lands in the original dir, or bwrap/job-init aborts; the victim dir is untouched |
+| P13 | Job writes into the project cache's `m2/` | Fail (that Maven then writes to `$JOB/m2` is not probed) |
 | P14 | Job writes into the project cache's `npm/` | Fail |
 | P15 | Container job pulls/tags/removes images and writes container layers | Project store byte-identical after the job (overlay) or job fails on digest change (fallback) |
 | P16 | Environment of the shim (run from the agent's Fence) | Warning for token- or key-like variable names (`*TOKEN*`, `*SECRET*`, `*KEY*`, `AWS_*`, `GH_*`); not a failure (R36) |
@@ -742,6 +742,7 @@ Closed in the refinement session:
    - bwrap ≥ 0.13.1, fd binds;
    - event log (R33);
    - P1–P16 green with `containers = false`; A4, A6 green.
+   - `actionbox run` and `actionbox conformance` (P1–P16, run in a throwaway project and caches; A-tests not covered) also done 2026-10-29, untested on the host.
    - 🟡 2026-10-29: code done (`internal/{protocol,job,client,shim,broker,engine,eventlog}`, `serve`, `mcp`, `job-init`, `verify --log`); unit tests green, `serve` + `mcp` smoke-tested in the sandbox (list, trust rejection, unknown action, event log). Open: `actionbox conformance` (P1–P16) and a first real job on the host.
 3. **M3 Containers:** Podman service in `job-init`, store overlay (O13); P1–P16 green with `containers = true`; A1 + A2 green.
 4. **M4 Fetch:** `request_fetch`, `fetch_status`, `actionbox fetch`, fetch ledger, npm guards, registry allowlist and coordinate flags (R34); A5 green.

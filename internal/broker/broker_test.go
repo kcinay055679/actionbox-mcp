@@ -22,6 +22,7 @@ import (
 	"actionbox/internal/config"
 	"actionbox/internal/definitions"
 	"actionbox/internal/job"
+	"actionbox/internal/jobrun"
 	"actionbox/internal/protocol"
 	"actionbox/internal/trust/trustfixtures"
 	"actionbox/internal/verify"
@@ -527,7 +528,7 @@ func TestRetentionPrunesOnStartupAndAfterJob(t *testing.T) {
 	ages := []time.Duration{72 * time.Hour, 30 * time.Hour, 3 * time.Hour, 2 * time.Hour, time.Hour}
 	var ids []string
 	for i, age := range ages {
-		id := fmt.Sprintf("%s-%08x", now.Add(-age).UTC().Format(idTimeLayout), i)
+		id := fmt.Sprintf("%s-%08x", now.Add(-age).UTC().Format(jobrun.IDTimeLayout), i)
 		ids = append(ids, id)
 		if err := os.MkdirAll(h.paths.JobDir("alpha", id), 0o700); err != nil {
 			t.Fatal(err)
@@ -571,7 +572,7 @@ func TestCancelKillsRunningAndQueuedJobs(t *testing.T) {
 		t.Error("still accepting")
 	}
 	for _, id := range []string{running, queued} {
-		rec, err := readRecord(filepath.Join(h.paths.JobDir("alpha", id), "job.json"))
+		rec, err := jobrun.ReadRecord(filepath.Join(h.paths.JobDir("alpha", id), "job.json"))
 		if err != nil || rec.State != protocol.JobKilled {
 			t.Errorf("%s: %+v %v", id, rec, err)
 		}
@@ -896,7 +897,7 @@ func jobDirs(t *testing.T, h *harness, project string) []string {
 	}
 	var ids []string
 	for _, e := range entries {
-		if validJobID(e.Name()) {
+		if jobrun.ValidID(e.Name()) {
 			ids = append(ids, e.Name())
 		}
 	}
@@ -905,12 +906,12 @@ func jobDirs(t *testing.T, h *harness, project string) []string {
 
 func rewriteState(t *testing.T, path string, state protocol.JobState) {
 	t.Helper()
-	rec, err := readRecord(path)
+	rec, err := jobrun.ReadRecord(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rec.State, rec.ExitCode = state, nil
-	if err := writeRecord(path, rec); err != nil {
+	if err := jobrun.WriteRecord(path, rec); err != nil {
 		t.Fatal(err)
 	}
 }

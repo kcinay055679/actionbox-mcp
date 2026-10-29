@@ -195,3 +195,34 @@ func TestRunnerStartFailureIsError(t *testing.T) {
 		t.Fatal("want error")
 	}
 }
+
+func TestRunnerAfterBindsRunsBetweenBindsAndExec(t *testing.T) {
+	// given
+	te := newTestEnv(t, false, exited(0))
+	target := filepath.Join(te.spec.RepoPath, "target")
+	var original, bound os.FileInfo
+	te.runner.AfterBinds = func() {
+		original, _ = os.Stat(target)
+		if err := os.Rename(target, target+".orig"); err != nil {
+			t.Fatal(err)
+		}
+		symlink(t, t.TempDir(), target)
+	}
+	te.runner.run = func(cmd *exec.Cmd) (syscall.WaitStatus, error) {
+		bound, _ = cmd.ExtraFiles[1].Stat()
+		return exited(0), nil
+	}
+
+	// when
+	if _, err := te.runner.Run(context.Background(), te.spec, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// then
+	if original == nil || bound == nil {
+		t.Fatal("hook or command did not run")
+	}
+	if !os.SameFile(bound, original) {
+		t.Error("writes fd does not point at the original dir")
+	}
+}

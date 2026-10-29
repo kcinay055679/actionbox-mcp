@@ -138,6 +138,8 @@ func (p Plan) env() [][2]string {
 func limitFlags(l limits.Limits) []string {
 	return []string{
 		"-p", "MemoryMax=" + strconv.FormatUint(l.MemoryMax, 10),
+		// else the job swaps instead of hitting MemoryMax
+		"-p", "MemorySwapMax=0",
 		"-p", "TasksMax=" + strconv.Itoa(l.TasksMax),
 		"-p", "CPUQuota=" + strconv.Itoa(l.CPUQuota) + "%",
 	}

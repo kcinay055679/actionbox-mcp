@@ -165,7 +165,7 @@ func TestCommandArgv(t *testing.T) {
 	// then
 	wantPrefix := []string{
 		"systemd-run", "--user", "--scope", "--quiet", "--collect",
-		"-p", "MemoryMax=6442450944", "-p", "TasksMax=4096", "-p", "CPUQuota=400%", "--",
+		"-p", "MemoryMax=6442450944", "-p", "MemorySwapMax=0", "-p", "TasksMax=4096", "-p", "CPUQuota=400%", "--",
 		"timeout", "--kill-after=30s", "1200",
 		"podman", "unshare", "--", "/opt/bwrap",
 	}
@@ -184,11 +184,11 @@ func TestLimitFlags(t *testing.T) {
 	}{
 		{
 			in:   limits.Limits{Timeout: time.Minute, MemoryMax: 8 << 30, TasksMax: 4096, CPUQuota: 400},
-			want: []string{"-p", "MemoryMax=8589934592", "-p", "TasksMax=4096", "-p", "CPUQuota=400%"},
+			want: []string{"-p", "MemoryMax=8589934592", "-p", "MemorySwapMax=0", "-p", "TasksMax=4096", "-p", "CPUQuota=400%"},
 		},
 		{
 			in:   limits.Limits{Timeout: time.Minute, MemoryMax: 512 << 20, TasksMax: 1, CPUQuota: 50},
-			want: []string{"-p", "MemoryMax=536870912", "-p", "TasksMax=1", "-p", "CPUQuota=50%"},
+			want: []string{"-p", "MemoryMax=536870912", "-p", "MemorySwapMax=0", "-p", "TasksMax=1", "-p", "CPUQuota=50%"},
 		},
 	}
 	for _, tt := range tests {
