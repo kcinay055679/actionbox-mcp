@@ -1,5 +1,11 @@
 {
   "$schema": "https://raw.githubusercontent.com/Use-Tusk/fence/main/docs/schema/fence.schema.json",
   "extends": "@base",
-  "filesystem": {"allowWrite": ["."]}
+  "network": {
+    "allowedDomains": ["proxy.golang.org", "sum.golang.org"]
+  },
+  "filesystem": {
+    "allowRead": ["/home/yminder/.local/share/mise/installs/go"],
+    "allowWrite": [".", "/home/yminder/go", "/home/yminder/.cache/go-build"]
+  }
 }
