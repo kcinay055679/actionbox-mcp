@@ -2,7 +2,7 @@
 
 actionbox lets a sandboxed coding agent run a fixed set of build and test commands, such as `mvn test` or a linter, that you have defined and signed. Each run is isolated from your secrets, the network and the rest of your machine. The agent gets the tools it needs, and its own sandbox stays as strict as it is.
 
-> **Status:** design phase. Nothing described here is implemented yet. [spec.md](spec.md) is the implementation spec.
+> **Status:** early implementation. Only `actionbox verify` (trust check) exists so far. [spec.md](spec.md) is the implementation spec.
 
 ## Why
 
@@ -17,7 +17,7 @@ Loosening the sandbox would expose your secrets to anything the agent writes or 
 | Linux with cgroups v2 and unprivileged user namespaces | Tested on Pop!_OS 22.04 |
 | systemd user session | Enforces resource limits per job |
 | Podman (rootless) with a subuid/subgid range | Only for actions that start containers |
-| bubblewrap ≥ 0.13.1 | Older versions lack a symlink-escape fix; install from Nix or build locally |
+| bubblewrap ≥ 0.13.1 | Older versions lack a symlink-escape fix; nixpkgs only has 0.12.0, so use a pinned Nix override or build locally (see [spikes/](spikes/)) |
 | GnuPG and a signing key | You sign the actions file with git |
 | Maven ≥ 3.9 / npm 12 | Only if your actions use them |
 | Claude Code inside Fence | Or any MCP client inside a sandbox that can reach a Unix socket |
@@ -167,6 +167,14 @@ The agent can only *request* dependencies, and only by exact coordinates: a Mave
 - **Build outputs:** jars and images built in jobs are untrusted until you rebuild them.
 - **Prompt injection through job output:** output is capped, not filtered.
 - **Multiple users:** actionbox is built for one person.
+
+## Development
+
+```bash
+go test ./...
+```
+
+The trust tests build signed test repos with `testdata/trust/gen-fixtures.sh`, so they need `bash`, `git`, `gpg` ≥ 2.2, `gpgv` and `python3`. They are skipped if one is missing.
 
 ## Further reading
 

@@ -1,0 +1,38 @@
+schema_version = 1
+
+[actions.test]
+description = "Run backend tests, optionally one class"
+invoker     = "agent"                  # agent | owner
+kind        = "run"                    # run | coordinate-fetch
+containers  = true                     # starts podman system service in the job
+argv        = ["mvn", "-o", "-B", "test", "-Dtest={test_class}"]
+writes      = ["target"]
+timeout     = "20m"
+memory_max  = "6G"
+[actions.test.params.test_class]
+pattern     = '[A-Za-z0-9_.#*]+'       # broker anchors as ^(...)$
+optional    = true
+description = "Surefire -Dtest filter"
+
+[actions.lint]
+description = "Frontend lint"
+invoker     = "agent"
+argv        = ["npx", "--offline", "eslint", "src"]
+writes      = []
+
+[actions.npm-ci]
+description = "Install node_modules from the project cache"
+invoker     = "agent"
+argv        = ["npm", "ci", "--offline"]   # install scripts run inside the job sandbox (R22)
+writes      = ["node_modules"]
+
+[actions.format]
+description = "Apply formatter to sources"
+invoker     = "agent"
+argv        = ["mvn", "-o", "-B", "spotless:apply"]
+writes      = ["src", "target"]
+
+[actions.fetch]
+description = "Fetch coordinates requested by the agent"
+invoker     = "owner"
+kind        = "coordinate-fetch"

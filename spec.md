@@ -71,7 +71,7 @@ The goal is a **fixed, per-project set of actions** that the agent can invoke an
 | bubblewrap (host package) | 0.6.1: lacks the symlink-escape fix (GHSA-pxhw-h44j-8pfx, fixed in 0.12.0) and `--bind-fd` (0.10.0) | [obs-H], [doc] bwrap NEWS |
 | bubblewrap (required, R25) | ≥ 0.13.1, path set in `config.toml` (`bwrap_path`); host package stays untouched | [doc] bwrap NEWS |
 | Maven (required, R28) | ≥ 3.9.0 for `maven.repo.local.tail` | [src] maven `DefaultRepositorySystemSessionFactory` |
-| npm (fetch guards, R29) | 12.x for `min-release-age`; `allow-git` / `allow-remote` default `none` | [src] npm/cli `definitions.js` |
+| npm (fetch guards, R29) | ≥ 11.14 on the host (`min-release-age` since 11.10, `allow-*` since 11.14); 12.x defaults `allow-git` / `allow-remote` to `none` | [src] npm/cli v12.2.1 `definitions.js` |
 | util-linux | 2.37.2 (no `unshare --map-auto`) | [obs-H] |
 | `/dev/net/tun` | `crw-rw-rw-` | [obs-H] |
 | subuid | `100000:65536` (inferred from the observed uid_map) | [obs-H] |
@@ -139,7 +139,7 @@ The goal is a **fixed, per-project set of actions** that the agent can invoke an
 
 | # | Question | Decision | Why | Rejected |
 |---|---|---|---|---|
-| R25 | bwrap version | Require bwrap ≥ 0.13.1 (Nix or local build), configured via `bwrap_path` | 0.6.1 lacks the 0.12.0 symlink-escape fix in the core of the engine | Host package 0.6.1 |
+| R25 | bwrap version | Require bwrap ≥ 0.13.1, configured via `bwrap_path`. nixpkgs ships 0.12.0 (2026-10), so install via a Nix `overrideAttrs` pinned to the v0.13.1 rev, or a meson build (see [spikes/](spikes/)) | 0.6.1 lacks the 0.12.0 symlink-escape fix in the core of the engine | Host package 0.6.1 |
 | R26 | Mount race (R7) | Broker opens each bound project path `O_PATH\|O_NOFOLLOW` (via `openat2` `RESOLVE_NO_SYMLINKS` from the repo dirfd), checks the fd, passes it with `--bind-fd` / `--ro-bind-fd`; post-mount inode check stays as backstop | Removes the check/mount race at the source; same pattern Flatpak adopted for CVE-2024-42472 | Inode check only |
 | R27 | Docker API pin | No pin by default; Testcontainers ≥ 2.0.3 falls back to 1.32 itself. Add `api.version=1.40` only if A2 fails | Avoid config that may be unnecessary | Pin 1.40 (R10) |
 | R28 | Project cache in jobs | Maven: project cache mounted **read-only** as `maven.repo.local.tail`, writable per-job head in the job dir. npm: cache stays writable, behavior observed (O11) | Jobs can't poison the Maven cache; npm cache gives "no guarantee" of keeping entries [doc] | Writable Maven cache; verdaccio now |
@@ -221,7 +221,7 @@ The agent's Fence must **not** have write access to any of these.
 | `~/.config/actionbox/config.toml` | Pinned fingerprint, projects, toolchain paths and env, limit caps and defaults, retention |
 | `~/.local/share/actionbox/keyring.gpg` | Verifier keyring for `gpgv`: the owner's **public** key only |
 | `~/.local/share/actionbox/projects/<name>/m2/` | Maven project cache (read-only in jobs, written by fetches only) |
-| `~/.local/share/actionbox/projects/<name>/ledger.jsonl` | Fetch ledger: one line per fetched file, `{request_id, ecosystem, coordinate, path, sha256, fetched_at}` |
+| `~/.local/share/actionbox/projects/<name>/ledger.jsonl` | Fetch ledger: one line per fetched file, `{request_id, ecosystem, coordinate, path, integrity, size, fetched_at}`; `integrity` is an SRI string (`sha256-…` for Maven files and images, npm's own `sha512-…`) |
 | `~/.local/share/actionbox/projects/<name>/npm/` | npm project cache |
 | `~/.local/share/actionbox/projects/<name>/containers/{store,run}/` | Podman graphroot + runroot (always used as a pair) |
 | `~/.local/share/actionbox/projects/<name>/lock` | `flock` target: one job or fetch at a time per project |
@@ -235,7 +235,7 @@ The agent's Fence must **not** have write access to any of these.
 ```toml
 pinned_fingerprint = "<40 hex, primary key>"
 bwrap_path = "/home/yminder/.nix-profile/bin/bwrap"   # ≥ 0.13.1 (R25)
-npm_min_release_age = 7                               # days, fetch only (R29) ⚠ unit
+npm_min_release_age = 7                               # integer days, fetch only (R29); validated by actionbox, npm ignores bad values
 
 [projects.pcts]
 path = "/home/yminder/projects/pcts"
@@ -321,8 +321,8 @@ kind        = "coordinate-fetch"
 **Symlinks (R7, R26)**
 - The broker opens the project root, then each writes dir and each existing protected path relative to it, with `openat2(…, O_PATH|O_NOFOLLOW, RESOLVE_NO_SYMLINKS)`. Any symlink component fails the job before start.
 - It creates missing writes dirs the same way (`mkdirat` on the parent fd).
-- bwrap binds **from those fds** (`--bind-fd`, `--ro-bind-fd`), so a path swapped after the check is never mounted.
-- Backstop: each fd's `(dev, inode)` is recorded in `meta.json`. After mounting, `job-init` re-stats each mount point and aborts on a mismatch.
+- bwrap binds **from those fds** (`--bind-fd FD DEST`, `--ro-bind-fd FD DEST`). It mounts via `/proc/self/fd/N`, then compares the fd's `(dev, inode)` with the mounted dest and dies with "Race condition binding dirfd" on a mismatch. It closes the fd afterwards, so it doesn't leak into the job [src] bubblewrap v0.13.1 `bubblewrap.c` L1150–1308. A path swapped after the check is therefore never mounted.
+- Backstop: each fd's `(dev, inode)` is recorded in `meta.json`. After mounting, `job-init` re-stats each mount point and aborts on a mismatch. This duplicates bwrap's own check and stays because it's cheap.
 
 **Limits**
 - Optional per action, clamped to the caps in `config.toml`.
@@ -348,41 +348,56 @@ Runs on every request, before anything executes. Inputs:
 **Git invocation.** Git is used only for plumbing that returns object IDs or raw object bytes, and always with:
 
 ```bash
-GIT_NO_REPLACE_OBJECTS=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
 GIT_ATTR_NOSYSTEM=1 git -C "$REPO" -c core.fsmonitor=false -c core.hooksPath=/dev/null ...
 ```
 
-Nothing git returns is trusted until re-hashed.
+- `GIT_NO_REPLACE_OBJECTS=1` does **not** disable grafts; `GIT_GRAFT_FILE=/dev/null` does (trust-attacks b, c).
+- Nothing git returns is trusted until re-hashed.
+- Each failure has a fixed reason string (in quotes below). The fixture manifest `testdata/trust/cases.json` uses the same strings.
 
 **Steps:**
 
-1. **Preconditions.** Fail if `.git/info/grafts` exists or the repo uses the SHA-256 object format. That format isn't supported yet; fail closed.
-2. **Candidate.** `C = git rev-list -1 HEAD -- .agent-actions.toml`. This is a hint only.
+1. **Preconditions.**
+   - `.git/info/grafts` exists → "grafts present".
+   - The repo uses the SHA-256 object format → "unsupported object format". That format isn't supported yet; fail closed.
+2. **Candidate.** `C = git rev-list -1 HEAD -- .agent-actions.toml`.
+   - This is a hint only. Shallow, commit-graph and forged objects can steer it, which is harmless because `C` is fully verified below.
+   - No commit touches the file → "missing definitions".
 3. **Commit object.** Read `git cat-file commit C`.
-   - Check that `sha1("commit <len>\0" + body) == C`.
-   - Split off the `gpgsig` header to get the signed payload and the signature.
-4. **Signature.** Run `gpgv --keyring KEYRING --status-fd 1 sig payload`.
-   - Require `GOODSIG` and a `VALIDSIG` line whose primary-key fingerprint field equals `PIN`.
-   - No other status may indicate expiry or revocation.
-   - `gpgv` reads no `gpg.*` git config and no agent sockets [doc] gpgv(1).
+   - Check that `sha1("commit <len>\0" + body) == C` → else "hash mismatch".
+   - Remove exactly the header named `gpgsig`, including its continuation lines, to get the signed payload.
+   - Fail with "signature status" if there is no `gpgsig` header, more than one, or the signature isn't OpenPGP-armored. SSH and X.509 signatures are never handed to any program.
+4. **Signature.** Run `gpgv --keyring <absolute KEYRING path> --status-fd 1 sig payload`. Require all of:
+   - exit code 0,
+   - exactly one `NEWSIG`, one `GOODSIG` and one `VALIDSIG`,
+   - `VALIDSIG` field 10 (primary-key fingerprint) == `PIN`, compared case-insensitively. Field 1 is the signing (sub)key.
+
+   "foreign key" is checked first: any `NO_PUBKEY`, or any `VALIDSIG` whose field 10 != `PIN`. This covers a signature by an unknown key (gpgv exits 2 with `ERRSIG` + `NO_PUBKEY` and no `VALIDSIG`), and an owner signature combined with a foreign one.
+   - none of `BADSIG`, `ERRSIG`, `EXPSIG`, `EXPKEYSIG`, `REVKEYSIG`, `KEYEXPIRED`, `KEYREVOKED`, `NO_PUBKEY`.
+
+   Any other violation → "signature status". Expired and revoked keys still exit 0 with a `VALIDSIG` line; only `EXPKEYSIG` / `REVKEYSIG` reveal them (trust-attacks g). `gpgv` reads no `gpg.*` git config and no agent sockets, and `--keyring` doesn't also load `trustedkeys.gpg`.
 5. **Tree.** Take the `tree` ID from the verified commit body.
-   - Read it with `git cat-file tree`, re-hash it, and find the root entry `.agent-actions.toml`.
-   - The mode must be `100644`; a symlink (`120000`) fails.
-6. **Blob.** Read the blob with `git cat-file blob` and re-hash it.
-7. **Working file.** Open `$REPO/.agent-actions.toml` with `O_NOFOLLOW` and require a regular file.
-   - Require its bytes to equal the blob byte-for-byte. Otherwise fail with "uncommitted edits".
+   - Read it with `git cat-file tree` and re-hash it → else "hash mismatch".
+   - Find the root entry `.agent-actions.toml`. Missing → "missing definitions".
+   - Mode `120000` → "symlink". Any other mode than `100644` → "file mode".
+6. **Blob.** Read the blob with `git cat-file blob` and re-hash it → else "hash mismatch".
+7. **Working file.** Open `$REPO/.agent-actions.toml` with `O_NOFOLLOW|O_NONBLOCK` (a FIFO must not block). A symlink → "symlink"; not a regular file → "file mode"; missing → "uncommitted edits".
+   - Require its bytes to equal the blob byte-for-byte → else "uncommitted edits".
 8. **Rollback (R6).** If `TRUSTED` is set and `C != TRUSTED`:
-   - Walk parents from `C`, re-hashing every commit object read.
-   - Stop when `TRUSTED` is found (pass) or after 10,000 commits / at roots (fail with "rollback").
-9. **Parse.** Parse **the verified blob**, never the working file, and validate it against §8.3.
+   - Walk parents from `C` using the parent IDs inside each re-hashed commit body, read with `cat-file`. Never use `rev-list`, which follows forged parents, grafts and `.git/shallow`.
+   - A re-hash failure → "hash mismatch".
+   - Stop when `TRUSTED` is found (pass), or fail with "rollback" after 10,000 commits or at the roots.
+9. **Parse.** Parse **the verified blob**, never the working file, and validate it against §8.3 → else "invalid definitions".
 10. **Record.** Store `C` as `TRUSTED`.
 
 Notes:
 
-- `verify --accept <commit>` runs steps 3–7 for `<commit>` and sets it as `TRUSTED` without the ancestry check.
+- `verify --accept <commit>` runs steps 1 and 3–7 for `<commit>` and sets it as `TRUSTED` without the ancestry check.
 - In the agent's Fence, `.git/config` and `.git/hooks` are already write-protected (`allowGitConfig` false by default) [src] fence v0.1.67 `internal/sandbox/linux.go`. The `-c` overrides are defense in depth.
 - `.git/objects`, `.git/refs`, `.gitattributes` and `.git/info/*` stay agent-writable. That's why steps 3–7 re-hash and avoid porcelain.
 - SHA-1 collision resistance is assumed. This is a residual risk (§10).
+- Every attack behind this design was reproduced on git 2.55.0 / gpg 2.2.27; a throwaway reference implementation of the steps above got the expected result on all fixture cases. See [docs/research/trust-attacks.md](docs/research/trust-attacks.md).
 
 ### 8.5 Socket protocol
 
@@ -493,7 +508,7 @@ Fetches run on the host, in an empty `mktemp -d` cwd, with the owner's normal cr
 | Ecosystem | Accepted format (anchored regex) | Command |
 |---|---|---|
 | Maven | See below | `mvn -B -ntp org.apache.maven.plugins:maven-dependency-plugin:3.11.0:get -Dartifact=<coord> -Dmaven.repo.local=<cache>/m2` |
-| npm | See below | `npm cache add <spec> --cache <cache>/npm --min-release-age=<config> --allow-git=none --allow-remote=none` ⚠ O12 flag syntax |
+| npm | See below | `npm cache add <spec> --cache <cache>/npm --min-release-age=<days> --allow-git=none --allow-remote=none --allow-file=none --allow-directory=none --logs-dir=<fetch tmp> --no-update-notifier` |
 | Image | See below | `podman --root <store> --runroot <run> --storage-driver=vfs pull <ref>` |
 
 Accepted formats:
@@ -532,9 +547,9 @@ Fetch requests:
   2. asks y/N (`N` → `rejected`),
   3. takes the project lock,
   4. runs argv arrays, never a shell,
-  5. appends every file the fetch added to the project cache, with its sha256, to `ledger.jsonl` (R29):
-     - Maven: files under `m2/` that changed during the fetch (snapshot of the tree before and after),
-     - npm: the `integrity` recorded by the npm cache index,
+  5. appends every file the fetch added to the project cache, with its integrity, to `ledger.jsonl` (R29):
+     - Maven: sha256 of the files under `m2/` that changed during the fetch (snapshot of the tree before and after),
+     - npm: `integrity` and `size` of the `pacote:tarball:<spec>` entry among the new `_cacache/index-v5` lines (before/after snapshot); `npm cache ls` prints keys only,
      - image: the manifest digest, which is already part of the coordinate.
 
 Expect iterative round trips: an offline build fails → the agent requests the missing artifact → the owner fetches → the agent retries.
@@ -582,7 +597,13 @@ A3 cases:
 - a forged intermediate commit on the ancestry path,
 - repo `gpg.openpgp.program` set,
 - a `.gitattributes` `textconv`,
-- the definitions file as a symlink.
+- the definitions file as a symlink,
+- an expired key, a revoked key,
+- an SSH-armored signature with a repo `gpg.ssh.program`,
+- a SHA-256 repo,
+- the definitions file with mode `100755`.
+
+`testdata/trust/gen-fixtures.sh OUTDIR` builds all of these repos (23 cases, needs git, gpg ≥ 2.2 and python3). It writes `cases.json` with the expected result, reason string, pin, keyring, trusted commit and, where relevant, a marker file that must not exist after verification.
 
 ## 10. Residual risks
 
@@ -601,11 +622,10 @@ A3 cases:
 |---|---|---|
 | O2 | Testcontainers 2.x ↔ Podman 3.4 compat API, unpinned (R27) | A2 with a real project |
 | O3 | R13 root layout, `--unshare-pid/ipc`, `--clearenv`, `/dev/net/tun` bind, non-container jobs under `podman unshare`, bwrap 0.13.1 | Conformance P1–P13 + A1 re-run |
-| O5 | Forged objects, replace refs, grafts, `gpg.openpgp.program`, textconv against §8.4 | A3 |
+| O5 | Go implementation of §8.4 against the A3 fixtures. The attacks themselves are reproduced and the algorithm passed with a throwaway reference implementation ([trust-attacks.md](docs/research/trust-attacks.md)) | A3 in Go (M1) |
 | O8 | Shared rootless pause process between host fetches and jobs | Observe during A1/A2; [inf] harmless, since bwrap adds its own mount namespace |
 | O10 | Do fds survive `podman unshare` into bwrap (R26)? | Spike; fallback `engine-exec` (§8.8) |
 | O11 | npm cache as the store: entries evicted or `npm ci --offline` writing to the cache unexpectedly | Observe during M4; move to verdaccio or a tarball dir if it bites |
-| O12 | npm 12 flag names/units for `min-release-age`, `allow-git`, `allow-remote` on `npm cache add` | `npm help config` on the installed npm |
 
 Closed in the refinement session:
 
@@ -616,6 +636,7 @@ Closed in the refinement session:
 | O6 | `containers.conf` key names | E15 |
 | O7 | maven-dependency-plugin version | R11 |
 | O9 | DECIDE-1…6 | R4, R7, R5, R6, R8, and R3 (DECIDE-6 moot) |
+| O12 | npm flag names and units | [docs/research/npm-fetch.md](docs/research/npm-fetch.md): `cache add` honors all guards; `min-release-age` is integer days |
 
 ## 12. Runbook
 
@@ -636,7 +657,7 @@ Closed in the refinement session:
 
 ## 13. Implementation milestones
 
-1. **M1 Trust:** §8.4 verifier + `verify` CLI; A3 green.
+1. **M1 Trust:** §8.4 verifier + `verify` CLI; A3 green. ✅ 2026-10-29: `internal/trust`, `internal/verify`, `internal/definitions`, `internal/config`, `actionbox verify`; all 23 A3 fixture cases pass.
 2. **M2 Engine without containers:**
    - `serve`, socket protocol, shim;
    - `list_actions` / `run_action` / `job_status`;
