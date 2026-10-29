@@ -30,6 +30,8 @@ func TestParseVerifyArgs(t *testing.T) {
 		{args: []string{"--accept"}, wantErr: true},
 		{args: []string{"--force"}, wantErr: true},
 		{args: []string{"a", "b"}, wantErr: true},
+		{args: []string{"--log"}, want: verifyArgs{log: true}},
+		{args: []string{"--log", "pcts"}, wantErr: true},
 	}
 	for _, tt := range tests {
 		got, err := parseVerifyArgs(tt.args)
@@ -57,11 +59,12 @@ func TestVerifyCommand(t *testing.T) {
 		{args: []string{"verify", "unsigned"}, wantCode: 1, wantOut: "unsigned: untrusted: signature status"},
 		{args: []string{"verify", "missing"}, wantCode: 1, wantOut: `unregistered project "missing"`},
 		{args: []string{"verify", "--bogus"}, wantCode: 2, wantOut: "unknown flag"},
+		{args: []string{"verify", "--log"}, wantCode: 0, wantOut: "event log: 0 lines, chain intact"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := run(context.Background(), tt.args, &stdout, &stderr)
+			code := run(context.Background(), tt.args, strings.NewReader(""), &stdout, &stderr)
 			out := stdout.String() + stderr.String()
 			if code != tt.wantCode || !strings.Contains(out, tt.wantOut) {
 				t.Errorf("code %d, output %q; want %d containing %q", code, out, tt.wantCode, tt.wantOut)

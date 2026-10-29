@@ -2,7 +2,7 @@
 
 actionbox lets a sandboxed coding agent run a fixed set of build and test commands, such as `mvn test` or a linter, that you have defined and signed. Each run is isolated from your secrets, the network and the rest of your machine. The agent gets the tools it needs, and its own sandbox stays as strict as it is.
 
-> **Status:** early implementation. Only `actionbox verify` (trust check) exists so far. [spec.md](spec.md) is the implementation spec.
+> **Status:** early implementation. `verify`, `serve` and `mcp` exist; jobs are untested on a real host, `fetch`, `run` and `conformance` are missing. [spec.md](spec.md) is the implementation spec.
 
 ## Why
 

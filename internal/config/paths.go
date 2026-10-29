@@ -47,6 +47,7 @@ func (p Paths) ContainersRun(name string) string {
 }
 
 func (p Paths) Socket() string                 { return filepath.Join(p.StateDir, "broker.sock") }
+func (p Paths) Events() string                 { return filepath.Join(p.StateDir, "events.jsonl") }
 func (p Paths) TrustFile(name string) string   { return filepath.Join(p.StateDir, "trust", name+".json") }
 func (p Paths) FetchRequest(id string) string  { return filepath.Join(p.StateDir, "fetch", id+".json") }
 func (p Paths) JobsDir(name string) string     { return filepath.Join(p.StateDir, "jobs", name) }

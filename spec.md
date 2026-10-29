@@ -183,6 +183,7 @@ Not adopted: secret scanning of job output (jobs hold no secrets) and prompt-inj
 | E14 | `pg-spike.sh` iterations | [obs-H] | See below |
 | E15 | Host versions and man pages | [obs-H] | `fence --version` 0.1.67; `podman` 3.4.4; `bwrap` 0.6.1; `containers.conf(5)`: `log_driver` in `[containers]`, `events_logger` and `cgroup_manager` in `[engine]` |
 | E16 | Upstream source reading | [src] | Fence v0.1.67 dangerous paths and config keys; Testcontainers 2.0.5 API version logic; Podman v3.4.4 compat API; maven-dependency-plugin 3.11.0 `get` goal (details in §8) |
+| E17 | `spikes/o10-fd-binds.sh` (2026-10-29): Podman 3.4.4, bwrap 0.13.1 (Nix override), kernel 7.1.1, pause process running | [obs-H] | 7/7 PASS: `O_RDONLY` and `O_PATH` fds survive `podman unshare`; `--bind-fd` / `--ro-bind-fd` work through it; fd not leaked into the sandbox; after a dir→symlink swap the write lands in the original dir, while a path-based `--bind` follows the symlink into the victim dir |
 
 E14 iterations:
 
@@ -247,7 +248,7 @@ The agent's Fence must **not** have write access to any of these.
 | `~/.local/state/actionbox/events.jsonl` | Event log (R33): append-only, one JSON object per line, each with `prev` = sha256 of the previous line |
 | `~/.local/state/actionbox/trust/<name>.json` | Trusted commit (rollback guard) |
 | `~/.local/state/actionbox/fetch/<request_id>.json` | Fetch requests |
-| `~/.local/state/actionbox/jobs/<name>/<job>/` | `log.txt`, `meta.json` (agent needs read), `xdg/`, `tmp/`, `home/` |
+| `~/.local/state/actionbox/jobs/<name>/<job>/` | `log.txt` (agent needs read), `job.json` (broker: action, params, state, exit code; survives broker restarts), `meta.json` (engine: bind `(dev, inode)` list, podman socket), `xdg/`, `tmp/`, `home/`, `ovl/` |
 
 `config.toml` sketch:
 
@@ -465,7 +466,7 @@ Notes:
 
    | Variable | Value |
    |---|---|
-   | `PATH` | System dirs + `[toolchain].path` |
+   | `PATH` | `[toolchain].path` first, then `/usr/local/bin:/usr/bin:/bin`, so toolchain `mvn`/`java` win over system ones |
    | `HOME` | `$JOB/home` |
    | `LANG` | `C.UTF-8` |
    | `TERM` | `dumb` |
@@ -481,6 +482,10 @@ Notes:
    - Writes are serialized with a `flock` on the log file.
    - `prev` is the sha256 of the previous line's bytes; the first line uses 64 zeros.
    - `actionbox verify --log` re-checks the chain.
+   - Limits of a plain hash chain:
+     - An edited line N shows up as a `prev` mismatch on line N+1.
+     - An edited or deleted **last** line can't be detected. `serve` therefore prints the chain head (sha256 of the last line) when it stops, so the owner has an outside anchor.
+   - A log whose last line is truncated (no trailing newline) refuses further appends instead of chaining onto the damage. Logging stops until the owner repairs the file.
 7. **Retention (R20).** After each job, and at `serve` startup, prune `jobs/<name>/`. Keep the newest `jobs_per_project` and drop anything older than `max_age`. The event log is never pruned.
 
 ### 8.8 Engine (R3, R13, R14, R25, R26, ADR 0001)
@@ -491,10 +496,11 @@ podman unshare -- "$BWRAP_PATH" \
   --dev /dev --dev-bind /dev/net/tun /dev/net/tun --proc /proc \
   --tmpfs /run --tmpfs /tmp --tmpfs /var/tmp --tmpfs /dev/shm \
   --tmpfs /media --tmpfs /mnt --tmpfs "$HOME" \
-  --tmpfs /nix/var/nix/daemon-socket \
+  <if it exists on the host: --tmpfs /nix/var/nix/daemon-socket> \
   --unshare-net --unshare-pid --unshare-ipc --new-session --die-with-parent \
   --clearenv <--setenv for each §8.7 variable> \
   <for each toolchain ro_path T: --ro-bind T T> \
+  --ro-bind <actionbox binary> <actionbox binary> \
   --ro-bind-fd $FD_REPO "$REPO" \
   <for each writes dir D: --bind-fd $FD_D "$REPO/D"> \
   <for each existing protected path P (root + depth ≤ 3 in writes): --ro-bind-fd $FD_P "$REPO/P"> \
@@ -511,10 +517,17 @@ podman unshare -- "$BWRAP_PATH" \
 - `--ro-bind / /` replaces `--dev-bind / /` (R13). Persistence paths (`/var/tmp`, `/dev/shm`), external drives (`/media`, `/mnt`) and the Nix daemon socket are hidden behind tmpfs.
 - **Order matters:** later mounts shadow earlier ones [doc] bwrap(1). Protected paths come **after** writes dirs.
 - `/dev/net/tun` is needed by `slirp4netns` for container networking inside the sandbox. ⚠ O3
-- The fds must survive `podman unshare` into bwrap. ⚠ O10. If `podman unshare` closes them, the broker execs `podman unshare -- actionbox engine-exec …`, which opens the fds inside the namespace with the same `openat2` rules before exec'ing bwrap.
+- The broker opens the fds and passes them through `podman unshare` to bwrap; they survive (E17). Not covered by E17: the first `podman unshare` without a running pause process (re-exec path), which source reading says keeps fds too; conformance runs exercise it.
 - The project cache's `m2/` is read-only; a job's resolved artifacts land in `$JOB/m2` and are discarded with the job dir (R28).
 - The npm cache is read-only; `npm ci --offline` reads tarballs by integrity and needs no writes (docs/research/npm-fetch.md). Jobs must use `npm ci`, not `npm install`, which appends index lines.
 - The container store (graphroot + runroot) is an overlay (R31, bwrap ≥ 0.11 `--overlay`): the project store is the read-only lower layer, writes land in `$JOB/ovl/upper` and are discarded with the job dir. Whether Podman's vfs driver and its locks work on overlayfs inside `podman unshare` is unverified. ⚠ O13. Fallback: plain `--bind` of the store, plus a digest comparison of all images (`podman images --digests`) before and after the job; any change fails the job and is logged.
+
+- The actionbox binary is re-bound read-only: under the `$HOME` tmpfs it would otherwise be hidden and `job-init` couldn't start.
+- `--tmpfs` over a path that doesn't exist fails on a read-only root, so the Nix socket dir is only hidden when present.
+- The engine creates missing project cache dirs (`m2/`, `npm/`, `containers/{store,run}`) before binding; `--ro-bind` fails on a missing source.
+- Container env: `XDG_RUNTIME_DIR=$JOB/xdg`, `CONTAINERS_CONF=$JOB/containers.conf`, `CONTAINERS_STORAGE_CONF=$JOB/storage.conf`, `DOCKER_HOST=unix://$JOB/xdg/podman.sock`. The overlay target is the project's `containers/` dir, so graphroot and runroot keep their host paths.
+- The outer commands (`systemd-run`, `podman unshare`) get only `PATH`, `HOME`, `USER`, `LOGNAME`, `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` from the broker's environment.
+- **Exit mapping:** `timeout`'s 124 → `timed_out`. 137 counts as `timed_out` only once the timeout has passed (kill-after); otherwise it and other signal exits → `killed`. `exit_code` is reported only for `succeeded`/`failed`. `job-init` exits 125 on a mount mismatch, with its message in the log.
 
 **`job-init`**
 1. Re-stats every recorded mount point and aborts on a `(dev, inode)` mismatch (R7).
@@ -532,7 +545,7 @@ podman unshare -- "$BWRAP_PATH" \
 
 **Verification status**
 - Verified core: E9, E14 (`podman unshare` + bwrap, vfs, shared runroot, Postgres with `--user 999`).
-- Not yet verified: the R13 root layout, `--unshare-pid/ipc`, `--new-session`, `--clearenv`, toolchain binds, the API service under Podman 3.4, non-container jobs under `podman unshare`, bwrap 0.13.1 and `--bind-fd`. ⚠ O3, O10, covered by §9.
+- Not yet verified: the R13 root layout, `--unshare-pid/ipc`, `--new-session`, `--clearenv`, toolchain binds, the API service under Podman 3.4, non-container jobs under `podman unshare`, and bwrap 0.13.1 beyond `--bind-fd` (E17). ⚠ O3, covered by §9.
 
 ### 8.9 Coordinate fetch (owner-only, R11, R17)
 
@@ -686,7 +699,6 @@ A3 cases:
 | O3 | R13 root layout, `--unshare-pid/ipc`, `--clearenv`, `/dev/net/tun` bind, non-container jobs under `podman unshare`, bwrap 0.13.1 | Conformance P1–P16 + A1 re-run |
 | O5 | Go implementation of §8.4 against the A3 fixtures. The attacks themselves are reproduced and the algorithm passed with a throwaway reference implementation ([trust-attacks.md](docs/research/trust-attacks.md)) | A3 in Go (M1) |
 | O8 | Shared rootless pause process between host fetches and jobs | Observe during A1/A2; [inf] harmless, since bwrap adds its own mount namespace |
-| O10 | Do fds survive `podman unshare` into bwrap (R26)? | Spike; fallback `engine-exec` (§8.8) |
 | O11 | npm cache as the store: entries evicted (writes are settled, R31) | Observe during M4; move to verdaccio or a tarball dir if it bites |
 | O13 | Container store as bwrap overlay under `podman unshare`: vfs driver, locks, runroot on overlayfs; unprivileged overlay needs kernel ≥ 5.11 | P15; fallback digest check (§8.8) |
 
@@ -699,10 +711,12 @@ Closed in the refinement session:
 | O6 | `containers.conf` key names | E15 |
 | O7 | maven-dependency-plugin version | R11 |
 | O9 | DECIDE-1…6 | R4, R7, R5, R6, R8, and R3 (DECIDE-6 moot) |
+| O10 | fds through `podman unshare` into bwrap (R26) | E17: all checks pass, no `engine-exec` fallback needed |
 | O12 | npm flag names and units | [docs/research/npm-fetch.md](docs/research/npm-fetch.md): `cache add` honors all guards; `min-release-age` is integer days |
 
 ## 12. Runbook
 
+- **Install bwrap ≥ 0.13.1:** build it with the Nix override from `spikes/o10-fd-binds.sh` into a persistent out-link, `nix build --impure --out-link ~/.local/share/actionbox/bwrap --expr '…'`, and set `bwrap_path = "~/.local/share/actionbox/bwrap/bin/bwrap"` (expanded). The spike's own out-link lives in its temp dir and is garbage-collected later.
 - **Start:** run `actionbox serve` in a terminal outside Fence. Ctrl-C revokes all agent capability.
 - **Register a project:** add `[projects.<name>] path = "…"` to `config.toml`, then run `actionbox verify <name>`.
 - **Add or change an action:** edit `.agent-actions.toml`, commit with `git commit -S`, run `actionbox verify`.
@@ -725,9 +739,10 @@ Closed in the refinement session:
    - `serve`, socket protocol, shim;
    - `list_actions` / `run_action` / `job_status`;
    - `job-init` inode check, env allowlist, limits, lock;
-   - bwrap ≥ 0.13.1, fd binds (O10 spike first);
+   - bwrap ≥ 0.13.1, fd binds;
    - event log (R33);
    - P1–P16 green with `containers = false`; A4, A6 green.
+   - 🟡 2026-10-29: code done (`internal/{protocol,job,client,shim,broker,engine,eventlog}`, `serve`, `mcp`, `job-init`, `verify --log`); unit tests green, `serve` + `mcp` smoke-tested in the sandbox (list, trust rejection, unknown action, event log). Open: `actionbox conformance` (P1–P16) and a first real job on the host.
 3. **M3 Containers:** Podman service in `job-init`, store overlay (O13); P1–P16 green with `containers = true`; A1 + A2 green.
 4. **M4 Fetch:** `request_fetch`, `fetch_status`, `actionbox fetch`, fetch ledger, npm guards, registry allowlist and coordinate flags (R34); A5 green.
 5. **M5 Ops:** retention, event display, launcher integration (Q18).

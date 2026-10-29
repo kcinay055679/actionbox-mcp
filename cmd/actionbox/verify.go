@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"actionbox/internal/config"
+	"actionbox/internal/eventlog"
 	"actionbox/internal/trust"
 	"actionbox/internal/verify"
 )
@@ -17,6 +18,7 @@ import (
 type verifyArgs struct {
 	project string
 	accept  string
+	log     bool
 }
 
 func parseVerifyArgs(args []string) (verifyArgs, error) {
@@ -31,6 +33,8 @@ func parseVerifyArgs(args []string) (verifyArgs, error) {
 			v.accept = args[i]
 		case strings.HasPrefix(arg, "--accept="):
 			v.accept = strings.TrimPrefix(arg, "--accept=")
+		case arg == "--log":
+			v.log = true
 		case strings.HasPrefix(arg, "-"):
 			return v, usageError{fmt.Sprintf("unknown flag %q", arg)}
 		case v.project == "":
@@ -39,6 +43,9 @@ func parseVerifyArgs(args []string) (verifyArgs, error) {
 			return v, usageError{fmt.Sprintf("unexpected argument %q", arg)}
 		}
 	}
+	if v.log && (v.project != "" || v.accept != "") {
+		return v, usageError{"--log takes no project or --accept"}
+	}
 	return v, nil
 }
 
@@ -46,6 +53,9 @@ func runVerify(ctx context.Context, args []string, stdout io.Writer) error {
 	v, err := parseVerifyArgs(args)
 	if err != nil {
 		return err
+	}
+	if v.log {
+		return verifyLog(stdout)
 	}
 	env, err := loadEnv()
 	if err != nil {
@@ -82,8 +92,34 @@ func detail(d string) string {
 	return " (" + d + ")"
 }
 
+func verifyLog(stdout io.Writer) error {
+	paths, err := defaultPaths()
+	if err != nil {
+		return err
+	}
+	lines, err := eventlog.Verify(paths.Events())
+	if err != nil {
+		return fmt.Errorf("event log %s: %w", paths.Events(), err)
+	}
+	log, err := eventlog.Open(paths.Events())
+	if err != nil {
+		return err
+	}
+	defer log.Close()
+	head, err := log.Head()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "event log: %d lines, chain intact, head %s\n", lines, head)
+	return nil
+}
+
+func defaultPaths() (config.Paths, error) {
+	return config.DefaultPaths()
+}
+
 func loadEnv() (verify.Env, error) {
-	paths, err := config.DefaultPaths()
+	paths, err := defaultPaths()
 	if err != nil {
 		return verify.Env{}, err
 	}
