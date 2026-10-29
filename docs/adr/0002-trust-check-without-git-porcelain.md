@@ -11,4 +11,7 @@ The broker therefore does the check itself:
 
 ## Considered Options
 
-- `git log --format=%G?` plus `git diff --quiet`, hardened with `-c` overrides (the original §8.4). Rejected: every repo-level setting that git honors would have to be overridden, and forged objects aren't detected at all.
+- `git log --format=%G?` plus `git diff --quiet`, hardened with `-c` overrides (the original §8.4). Rejected: every repo-level setting that git honors would have to be overridden, and forged objects aren't detected at all. Reproduced on git 2.55.0 ([trust-attacks.md](../research/trust-attacks.md)):
+  - A forged blob behind a signed commit passed both `%G?` and `git diff --quiet`.
+  - `-c gpg.program=gpg` doesn't cover SSH- or X.509-armored signatures. Git then runs the repo's `gpg.ssh.program`, and a fake one got `%G?`=G.
+  - `git diff --quiet` runs a repo-configured textconv driver, which can make a real edit look clean.
